@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "carbon-voice-claude-channel": {
+      "command": "npx",
+      "args": ["tsx", "/Users/travis/Documents/Code/cv-claude-channels/cv-claude-channels.ts"]
+    }
+  }
+}
