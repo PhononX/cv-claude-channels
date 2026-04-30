@@ -52,7 +52,7 @@ const SEEN_TTL_MS          = Number(process.env.CV_SEEN_TTL_MS ?? 5 * 60 * 1_000
 const POLL_INTERVAL_MS     = Number(process.env.CV_POLL_INTERVAL_MS  ?? 5_000)
 const WS_RETRY_MAX_MS      = Number(process.env.CV_WS_RETRY_MAX_MS   ?? 30_000)
 const STATE_PATH           = process.env.CV_STATE_PATH
-  ?? path.join(os.homedir(), '.claude', 'channels', 'cv', 'state.json')
+  ?? path.join(os.homedir(), '.claude', 'channels', 'cv', `state${CONVERSATION_ID ? `-${CONVERSATION_ID}` : ''}.json`)
 
 if (!PAT) {
   process.stderr.write('cv-claude-channels: CV_PAT is required\n')
@@ -445,15 +445,16 @@ async function fetchMissedMessages() {
     return
   }
 
-  process.stderr.write(`cv-claude-channels: fetching messages since ${state.lastSeenAt}\n`)
-
-  const res = await cvFetch('POST', '/v3/messages/recent', {
+  const recentBody = {
     date: state.lastSeenAt,
     direction: 'newer',
     limit: 100,
     use_last_updated: false,
     ...(CONVERSATION_ID ? { channel_id: CONVERSATION_ID } : {}),
-  })
+  }
+  process.stderr.write(`cv-claude-channels: POST /v3/messages/recent ${JSON.stringify(recentBody)}\n`)
+
+  const res = await cvFetch('POST', '/v3/messages/recent', recentBody)
 
   if (!res.ok) {
     process.stderr.write(`cv-claude-channels: fetchMissedMessages ${res.status}\n`)
@@ -461,7 +462,20 @@ async function fetchMissedMessages() {
   }
 
   const data = await res.json() as CVMessageEvent[]
-  const messages: CVMessageEvent[] = Array.isArray(data) ? data : []
+  const allMessages: CVMessageEvent[] = Array.isArray(data) ? data : []
+
+  // Client-side guard: CV's recent endpoint may ignore channel_id filter
+  let messages = allMessages
+  if (CONVERSATION_ID) {
+    messages = allMessages.filter(m => m.channel_ids.includes(CONVERSATION_ID))
+    const dropped = allMessages.length - messages.length
+    if (allMessages.length > 0) {
+      process.stderr.write(
+        `cv-claude-channels: /recents returned ${allMessages.length} msgs, ` +
+        `${dropped} filtered (channels: ${[...new Set(allMessages.map(m => m.channel_ids[0]))].join(', ')})\n`,
+      )
+    }
+  }
 
   messages.sort((a, b) => a.created_at.localeCompare(b.created_at))
 
@@ -472,7 +486,7 @@ async function fetchMissedMessages() {
 
   if (messages.length > 0) {
     process.stderr.write(
-      `cv-claude-channels: fetched ${messages.length}, emitted ${processed} new\n`,
+      `cv-claude-channels: emitted ${processed} new\n`,
     )
   }
 
@@ -519,9 +533,22 @@ async function connectWebSocket(): Promise<void> {
 
     // message:created fires immediately (transcript not yet ready)
     // message:updated fires when transcription completes — trigger a fetch for both
-    const onMessageEvent = async (payload: { _id?: string; status?: string }) => {
-      process.stderr.write(`cv-claude-channels: WS event received (status=${payload?.status})\n`)
+    const onMessageEvent = async (payload: {
+      _id?: string
+      status?: string
+      channel_id?: string
+      channel_ids?: string[]
+    }) => {
+      const payloadChannel = payload?.channel_id ?? payload?.channel_ids?.[0] ?? 'unknown'
+      process.stderr.write(`cv-claude-channels: WS event (status=${payload?.status} channel=${payloadChannel}) raw=${JSON.stringify(payload)}\n`)
       if (payload?.status !== 'active') return
+
+      // Skip fetch if the event is for a different conversation
+      if (CONVERSATION_ID && payloadChannel !== 'unknown' && payloadChannel !== CONVERSATION_ID) {
+        process.stderr.write(`cv-claude-channels: WS event skipped (wrong channel)\n`)
+        return
+      }
+
       await fetchMissedMessages()
     }
 
