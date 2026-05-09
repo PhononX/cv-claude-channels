@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "cv-claude-channel": {
+      "command": "npx",
+      "args": ["@phononx/cv-claude-channel"],
+      "env": {
+        "CV_PAT": "your-personal-access-token-here",  // REQUIRED: Your Carbon Voice Personal Access Token
+        "CV_CONVERSATION_ID": "",  // OPTIONAL: Scope to a specific conversation GUID. Omit to receive all conversations.
+        "CV_REACTION_ID": "",  // OPTIONAL: Specific reaction ID to add on message receipt. Omit for no reaction.
+        "CV_ALLOWED_SENDERS": "",  // OPTIONAL: Comma-separated list of allowed user IDs for sender gating. Omit for no restriction.
+        "CV_SEEN_TTL_MS": "300000",  // OPTIONAL: Deduplication TTL in milliseconds (default: 300000 = 5 minutes)
+        "CV_POLL_INTERVAL_MS": "5000",  // OPTIONAL: Polling interval in milliseconds when WebSocket fails (default: 5000 = 5 seconds)
+        "CV_WS_RETRY_MAX_MS": "30000"  // OPTIONAL: Max WebSocket retry backoff in milliseconds (default: 30000 = 30 seconds)
+      }
+    }
+  }
+}

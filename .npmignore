@@ -1,0 +1,45 @@
+# Source files
+*.ts
+!*.d.ts
+
+# Development files
+.mcp.json
+.mcp.json.local
+.env
+
+# Build artifacts (except what we want to publish)
+dist/*.map
+dist/*.d.ts.map
+
+# Tests
+*.test.ts
+*.spec.ts
+test/
+tests/
+
+# Documentation (except README)
+*.md
+!README.md
+
+# Git
+.git/
+.gitignore
+.github/
+
+# CI/CD
+.gitlab-ci.yml
+.travis.yml
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Node (in case node_modules gets included)
+node_modules/

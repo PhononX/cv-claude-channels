@@ -1,17 +1,44 @@
 {
-  "name": "cv-claude-channels",
+  "name": "@phononx/cv-claude-channel",
   "version": "0.1.0",
+  "description": "Carbon Voice Claude Channel server - bridges Carbon Voice conversations into Claude Code sessions",
   "type": "module",
+  "main": "./dist/cv-claude-channel.js",
+  "bin": "./dist/cv-claude-channel.js",
   "scripts": {
-    "start": "tsx cv-claude-channels.ts"
+    "start": "tsx cv-claude-channel.ts",
+    "build": "tsc",
+    "prepublishOnly": "npm run build"
   },
+  "keywords": [
+    "claude-code",
+    "mcp",
+    "channel",
+    "carbon-voice",
+    "voice",
+    "audio"
+  ],
+  "author": "PhononX",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/PhononX/cv-claude-channel"
+  },
+  "bugs": {
+    "url": "https://github.com/PhononX/cv-claude-channel/issues"
+  },
+  "homepage": "https://github.com/PhononX/cv-claude-channel#readme",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
-    "socket.io-client": "^4.0.0"
+    "socket.io-client": "^4.0.0",
+    "zod": "^3.0.0"
   },
   "devDependencies": {
     "tsx": "^4.0.0",
     "typescript": "^5.0.0",
     "@types/node": "^20.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
 }

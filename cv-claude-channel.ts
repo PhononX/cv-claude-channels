@@ -1,6 +1,6 @@
 #!/usr/bin/env tsx
 /**
- * cv-claude-channels.ts
+ * cv-claude-channel.ts
  * Carbon Voice → Claude Code channel server
  *
  * An MCP channel server that bridges Carbon Voice messages into a running
@@ -10,9 +10,9 @@
  * SETUP — add to .mcp.json in your project root:
  * {
  *   "mcpServers": {
- *     "carbon-voice": {
+ *     "cv-claude-channel": {
  *       "command": "npx",
- *       "args": ["tsx", "./cv-claude-channels.ts"],
+ *       "args": ["tsx", "./cv-claude-channel.ts"],
  *       "env": {
  *         "CV_PAT": "your-personal-access-token",
  *         "CV_CONVERSATION_ID": ""  // optional: scope to one conversation guid; omit to receive all
@@ -22,7 +22,7 @@
  * }
  *
  * Then start Claude Code with:
- *   claude --dangerously-load-development-channels server:carbon-voice-claude-channel
+ *   claude --dangerously-load-development-channels server:cv-claude-channel
  *
  * WebSocket is the primary transport (polling is the fallback).
  * Auth uses ?token=PAT query param — confirm with Russell if 401/4xxx close codes appear.
@@ -33,6 +33,7 @@
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js'
+import { z } from 'zod'
 import { io, Socket } from 'socket.io-client'
 import * as fs from 'node:fs/promises'
 import * as path from 'node:path'
@@ -48,6 +49,7 @@ const CV_API_BASE = 'https://api.carbonvoice.app'
 const PAT                  = process.env.CV_PAT ?? ''
 const CONVERSATION_ID      = process.env.CV_CONVERSATION_ID ?? ''   // optional: scope to one conversation
 const REACTION_ID          = process.env.CV_REACTION_ID ?? ''       // optional: pin a specific reaction ID
+const ALLOWED_SENDERS      = process.env.CV_ALLOWED_SENDERS ?? ''   // optional: comma-separated list of allowed user IDs
 const SEEN_TTL_MS          = Number(process.env.CV_SEEN_TTL_MS ?? 5 * 60 * 1_000)
 const POLL_INTERVAL_MS     = Number(process.env.CV_POLL_INTERVAL_MS  ?? 5_000)
 const WS_RETRY_MAX_MS      = Number(process.env.CV_WS_RETRY_MAX_MS   ?? 30_000)
@@ -57,6 +59,12 @@ const STATE_PATH           = process.env.CV_STATE_PATH
 if (!PAT) {
   process.stderr.write('cv-claude-channels: CV_PAT is required\n')
   process.exit(1)
+}
+
+// Parse allowed senders into a Set (empty set = no restriction)
+const allowedSenders = new Set(ALLOWED_SENDERS.split(',').map(s => s.trim()).filter(Boolean))
+if (allowedSenders.size > 0) {
+  process.stderr.write(`cv-claude-channels: sender gating enabled, ${allowedSenders.size} allowed senders\n`)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -119,7 +127,10 @@ const mcp = new Server(
   { name: 'Carbon Voice Claude Channel', version: '0.1.0' },
   {
     capabilities: {
-      experimental: { 'claude/channel': {} },
+      experimental: {
+        'claude/channel': {},
+        'claude/channel/permission': {}, // opt in to permission relay
+      },
       tools: {},
     },
     instructions: `
@@ -142,6 +153,9 @@ To reply, call the send_message tool with:
   text             — your response (Carbon Voice converts it to audio automatically)
 
 Never reply to a reply — always use reply_to_id which already handles threading.
+
+Permission prompts may arrive asking you to approve tool usage. Reply with
+"yes <request_id>" or "no <request_id>" to grant or deny permission.
     `.trim(),
   },
 )
@@ -217,6 +231,47 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   return {
     content: [{ type: 'text', text: `sent: ${sent_id}` }],
   }
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PERMISSION RELAY: forward Claude Code permission prompts to CV
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Regex to match "yes <id>" or "no <id>" replies
+// [a-km-z] is the ID alphabet Claude Code uses (lowercase, skips 'l')
+// /i tolerates phone autocorrect; lowercase the capture before sending
+const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
+
+// Schema for permission request notifications from Claude Code
+const PermissionRequestSchema = z.object({
+  method: z.literal('notifications/claude/channel/permission_request'),
+  params: z.object({
+    request_id: z.string(), // five lowercase letters
+    tool_name: z.string(), // e.g. "Bash", "Write"
+    description: z.string(), // human-readable summary
+    input_preview: z.string(), // tool args as JSON, truncated
+  }),
+})
+
+// Handler for permission requests from Claude Code
+mcp.setNotificationHandler(PermissionRequestSchema, async ({ params }) => {
+  // Don't relay permission requests for this server's own tools — approving
+  // send_message via send_message creates an unresolvable loop.
+  if (params.tool_name.endsWith('__send_message') || params.tool_name === 'send_message') return
+
+  await mcp.notification({
+    method: 'notifications/claude/channel',
+    params: {
+      content: `Claude wants to run ${params.tool_name}: ${params.description}\n\n` +
+        `Reply "yes ${params.request_id}" or "no ${params.request_id}" to grant or deny permission.`,
+      meta: {
+        source: 'carbon-voice',
+        type: 'permission_request',
+        request_id: params.request_id,
+        tool_name: params.tool_name,
+      },
+    },
+  })
 })
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -387,6 +442,12 @@ async function processMessage(event: CVMessageEvent): Promise<boolean> {
   // Filter self
   if (event.creator_id === state.ownUserId) return false
 
+  // Sender gating: check allowlist before processing
+  if (allowedSenders.size > 0 && !allowedSenders.has(event.creator_id)) {
+    process.stderr.write(`cv-claude-channels: dropped message from unauthorized sender ${event.creator_id}\n`)
+    return false
+  }
+
   // Deduplicate — only after confirming the message is ready
   if (isRecentlySeen(event.message_id)) return false
 
@@ -407,6 +468,29 @@ async function processMessage(event: CVMessageEvent): Promise<boolean> {
   markSeen(event.message_id)
 
   const reply_to_id = event.parent_message_id ?? event.message_id
+
+  // Check for permission reply format (yes <id> or no <id>)
+  const permMatch = PERMISSION_REPLY_RE.exec(transcript)
+  if (permMatch) {
+    const verdict = permMatch[1].toLowerCase().startsWith('y') ? 'allow' : 'deny'
+    const requestId = permMatch[2].toLowerCase()
+    process.stderr.write(`cv-claude-channels: permission verdict ${verdict} for request ${requestId}\n`)
+
+    // Emit the verdict notification back to Claude Code
+    await mcp.notification({
+      method: 'notifications/claude/channel/permission',
+      params: {
+        request_id: requestId,
+        behavior: verdict,
+      },
+    })
+
+    // Acknowledge the permission reply message
+    await addReaction(event.message_id)
+    await markRead(channel_id, event.message_id)
+
+    return true // handled as verdict, don't also forward as chat
+  }
 
   // Emit to Claude Code
   await mcp.notification({
