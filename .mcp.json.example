@@ -2,7 +2,7 @@
   "mcpServers": {
     "cv-claude-channel": {
       "command": "npx",
-      "args": ["@phononx/cv-claude-channel"],
+      "args": ["@carbonvoice/cv-claude-channel"],
       "env": {
         "CV_PAT": "your-personal-access-token-here",  // REQUIRED: Your Carbon Voice Personal Access Token
         "CV_CONVERSATION_ID": "",  // OPTIONAL: Scope to a specific conversation GUID. Omit to receive all conversations.

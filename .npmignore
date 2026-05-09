@@ -6,6 +6,7 @@
 .mcp.json
 .mcp.json.local
 .env
+.claude/
 
 # Build artifacts (except what we want to publish)
 dist/*.map

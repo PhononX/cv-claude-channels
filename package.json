@@ -1,5 +1,5 @@
 {
-  "name": "@phononx/cv-claude-channel",
+  "name": "@carbonvoice/cv-claude-channel",
   "version": "0.1.0",
   "description": "Carbon Voice Claude Channel server - bridges Carbon Voice conversations into Claude Code sessions",
   "type": "module",
