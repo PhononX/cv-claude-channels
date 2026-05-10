@@ -25,7 +25,7 @@ Add to your project's `.mcp.json`:
   "mcpServers": {
     "cv-claude-channel": {
       "command": "npx",
-      "args": ["@phononx/cv-claude-channel"],
+      "args": ["@carbonvoice/cv-claude-channel"],
       "env": {
         "CV_PAT": "your-personal-access-token"
       }
@@ -39,7 +39,7 @@ Add to your project's `.mcp.json`:
 Install globally:
 
 ```bash
-npm install -g @phononx/cv-claude-channel
+npm install -g @carbonvoice/cv-claude-channel
 ```
 
 Then configure `.mcp.json`:
@@ -79,6 +79,7 @@ npm start
 - `CV_CONVERSATION_ID` - Scope to a specific conversation (omit to receive all)
 - `CV_REACTION_ID` - Specific reaction ID to add on message receipt
 - `CV_ALLOWED_SENDERS` - Comma-separated list of allowed user IDs (for sender gating)
+- `CV_IGNORED_SENDERS_LOG` - Path to log file for ignored sender attempts (default: `~/.claude/channels/cv/ignored-senders.log`)
 - `CV_SEEN_TTL_MS` - Deduplication TTL in milliseconds (default: 5 minutes)
 - `CV_POLL_INTERVAL_MS` - Polling interval in milliseconds (default: 5 seconds)
 - `CV_WS_RETRY_MAX_MS` - Max WebSocket retry backoff in milliseconds (default: 30 seconds)

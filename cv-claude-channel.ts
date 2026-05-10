@@ -50,6 +50,8 @@ const PAT                  = process.env.CV_PAT ?? ''
 const CONVERSATION_ID      = process.env.CV_CONVERSATION_ID ?? ''   // optional: scope to one conversation
 const REACTION_ID          = process.env.CV_REACTION_ID ?? ''       // optional: pin a specific reaction ID
 const ALLOWED_SENDERS      = process.env.CV_ALLOWED_SENDERS ?? ''   // optional: comma-separated list of allowed user IDs
+const IGNORED_SENDERS_LOG  = process.env.CV_IGNORED_SENDERS_LOG
+  ?? path.join(os.homedir(), '.claude', 'channels', 'cv', 'ignored-senders.log')
 const SEEN_TTL_MS          = Number(process.env.CV_SEEN_TTL_MS ?? 5 * 60 * 1_000)
 const POLL_INTERVAL_MS     = Number(process.env.CV_POLL_INTERVAL_MS  ?? 5_000)
 const WS_RETRY_MAX_MS      = Number(process.env.CV_WS_RETRY_MAX_MS   ?? 30_000)
@@ -289,6 +291,29 @@ function cvFetch(method: string, path: string, body?: unknown): Promise<Response
   })
 }
 
+const userNameCache = new Map<string, string>()
+
+async function resolveUserName(userId: string): Promise<string> {
+  if (userNameCache.has(userId)) return userNameCache.get(userId)!
+  try {
+    const res = await cvFetch('GET', `/v3/users/${userId}`)
+    if (res.ok) {
+      const data = await res.json() as { display_name?: string; username?: string; name?: string }
+      const name = data.display_name ?? data.username ?? data.name ?? userId
+      userNameCache.set(userId, name)
+      return name
+    }
+  } catch { /* fall through */ }
+  return userId
+}
+
+async function logIgnoredSender(userId: string): Promise<void> {
+  const username = await resolveUserName(userId)
+  const entry = JSON.stringify({ time: new Date().toISOString(), userId, username }) + '\n'
+  await fs.mkdir(path.dirname(IGNORED_SENDERS_LOG), { recursive: true })
+  await fs.appendFile(IGNORED_SENDERS_LOG, entry, 'utf8')
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // REACTIONS
 // ─────────────────────────────────────────────────────────────────────────────
@@ -445,6 +470,7 @@ async function processMessage(event: CVMessageEvent): Promise<boolean> {
   // Sender gating: check allowlist before processing
   if (allowedSenders.size > 0 && !allowedSenders.has(event.creator_id)) {
     process.stderr.write(`cv-claude-channels: dropped message from unauthorized sender ${event.creator_id}\n`)
+    logIgnoredSender(event.creator_id).catch(() => {})
     return false
   }
 
