@@ -1,4 +1,4 @@
-#!/usr/bin/env tsx
+#!/usr/bin/env node
 /**
  * cv-claude-channel.ts
  * Carbon Voice → Claude Code channel server
