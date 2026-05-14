@@ -1,5 +1,7 @@
 # Carbon Voice Claude Channel for Claude Code
 
+[![npm version](https://badge.fury.io/js/@carbonvoice%2fcv-claude-channel.svg)](https://www.npmjs.com/package/@carbonvoice/cv-claude-channel)
+
 A Claude Code channel server that bridges Carbon Voice conversations into Claude Code sessions. Receive real-time voice messages and reply back with text-to-speech.
 
 If computer is offline, messages will be queued and delivered when connection is restored.
