@@ -87,6 +87,7 @@ interface State {
   recentlySeen: Map<string, number>     // message_id → expiry epoch ms
   lastSeenAtDirty: boolean              // pending disk write
   flushTimer: ReturnType<typeof setTimeout> | null
+  lastCVContext: { channelId: string; replyToId: string } | null  // for permission relay
 }
 
 // Matches the actual CV REST API message shape
@@ -119,6 +120,7 @@ const state: State = {
   recentlySeen: new Map<string, number>(),
   lastSeenAtDirty: false,
   flushTimer: null,
+  lastCVContext: null,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -261,19 +263,31 @@ mcp.setNotificationHandler(PermissionRequestSchema, async ({ params }) => {
   // send_message via send_message creates an unresolvable loop.
   if (params.tool_name.endsWith('__send_message') || params.tool_name === 'send_message') return
 
-  await mcp.notification({
-    method: 'notifications/claude/channel',
-    params: {
-      content: `Claude wants to run ${params.tool_name}: ${params.description}\n\n` +
-        `Reply "yes ${params.request_id}" or "no ${params.request_id}" to grant or deny permission.`,
-      meta: {
-        source: 'carbon-voice',
-        type: 'permission_request',
-        request_id: params.request_id,
-        tool_name: params.tool_name,
-      },
-    },
+  const ctx = state.lastCVContext
+  if (!ctx) {
+    process.stderr.write(`cv-claude-channels: permission request for ${params.tool_name} but no CV context to relay to\n`)
+    return
+  }
+
+  const text =
+    `Claude wants to run ${params.tool_name}: ${params.description}\n\n` +
+    `Reply "yes ${params.request_id}" or "no ${params.request_id}" to grant or deny permission.`
+
+  const unique_client_id = crypto.randomUUID()
+  const res = await cvFetch('POST', '/v3/messages/start', {
+    transcript: text,
+    is_text_message: true,
+    unique_client_id,
+    is_streaming: false,
+    channel_id: ctx.channelId,
+    reply_to_message_id: ctx.replyToId,
   })
+
+  if (!res.ok) {
+    process.stderr.write(`cv-claude-channels: permission relay send failed ${res.status} for ${params.request_id}\n`)
+  } else {
+    process.stderr.write(`cv-claude-channels: permission request for ${params.tool_name} relayed to CV (request_id=${params.request_id})\n`)
+  }
 })
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -461,7 +475,9 @@ function markSeen(messageId: string) {
 // CORE: process a message (shared by WS and polling paths)
 // ─────────────────────────────────────────────────────────────────────────────
 
-async function processMessage(event: CVMessageEvent): Promise<boolean> {
+// Returns: true = delivered to Claude, false = filtered (skip, safe to advance cursor),
+//          null = needs retry (do not advance cursor past this message)
+async function processMessage(event: CVMessageEvent): Promise<boolean | null> {
   const channel_id = event.channel_ids[0] ?? ''
 
   // Filter self
@@ -489,9 +505,7 @@ async function processMessage(event: CVMessageEvent): Promise<boolean> {
   )
 
   // Not ready yet — let the next poll retry without marking seen
-  if (!transcript) return false
-
-  markSeen(event.message_id)
+  if (!transcript) return null
 
   const reply_to_id = event.parent_message_id ?? event.message_id
 
@@ -502,42 +516,50 @@ async function processMessage(event: CVMessageEvent): Promise<boolean> {
     const requestId = permMatch[2].toLowerCase()
     process.stderr.write(`cv-claude-channels: permission verdict ${verdict} for request ${requestId}\n`)
 
-    // Emit the verdict notification back to Claude Code
-    await mcp.notification({
-      method: 'notifications/claude/channel/permission',
-      params: {
-        request_id: requestId,
-        behavior: verdict,
-      },
-    })
+    try {
+      await mcp.notification({
+        method: 'notifications/claude/channel/permission',
+        params: {
+          request_id: requestId,
+          behavior: verdict,
+        },
+      })
+    } catch (err) {
+      process.stderr.write(`cv-claude-channels: permission notification failed for ${event.message_id}, will retry: ${err}\n`)
+      return null
+    }
 
-    // Acknowledge the permission reply message
+    markSeen(event.message_id)
     await addReaction(event.message_id)
     await markRead(channel_id, event.message_id)
-
     return true // handled as verdict, don't also forward as chat
   }
 
-  // Emit to Claude Code
-  await mcp.notification({
-    method: 'notifications/claude/channel',
-    params: {
-      content: transcript,
-      meta: {
-        source:        'carbon-voice',
-        channel_id,
-        message_id:    event.message_id,
-        sender_id:     event.creator_id,
-        is_reply:      event.parent_message_id ? 'true' : 'false',
-        reply_to_id,
+  // Emit to Claude Code — only mark seen/acknowledged if it succeeds
+  try {
+    await mcp.notification({
+      method: 'notifications/claude/channel',
+      params: {
+        content: transcript,
+        meta: {
+          source:        'carbon-voice',
+          channel_id,
+          message_id:    event.message_id,
+          sender_id:     event.creator_id,
+          is_reply:      event.parent_message_id ? 'true' : 'false',
+          reply_to_id,
+        },
       },
-    },
-  })
+    })
+    state.lastCVContext = { channelId: channel_id, replyToId: reply_to_id }
+  } catch (err) {
+    process.stderr.write(`cv-claude-channels: notification failed for ${event.message_id}, will retry: ${err}\n`)
+    return null
+  }
 
-  // Acknowledge only after successfully emitting
+  markSeen(event.message_id)
   await addReaction(event.message_id)
   await markRead(channel_id, event.message_id)
-
   return true
 }
 
@@ -590,18 +612,29 @@ async function fetchMissedMessages() {
   messages.sort((a, b) => a.created_at.localeCompare(b.created_at))
 
   let processed = 0
-  for (const msg of messages) {
-    if (await processMessage(msg)) processed++
+  let firstRetryIdx: number | null = null
+
+  for (let i = 0; i < messages.length; i++) {
+    const result = await processMessage(messages[i])
+    if (result === true) processed++
+    else if (result === null && firstRetryIdx === null) firstRetryIdx = i
   }
 
   if (messages.length > 0) {
     process.stderr.write(
-      `cv-claude-channels: emitted ${processed} new\n`,
+      `cv-claude-channels: emitted ${processed} new` +
+      (firstRetryIdx !== null ? ', cursor held for retry' : '') +
+      '\n',
     )
   }
 
-  // Advance cursor to when this request started, not to message timestamps
-  advanceCursor(requestStartedAt)
+  // Advance cursor to requestStartedAt only if every message was delivered or
+  // filtered. If any message needs retry, leave the cursor unchanged so the
+  // next poll re-fetches from the same window. Already-delivered messages are
+  // protected from double-delivery by the markSeen dedup cache.
+  if (firstRetryIdx === null) {
+    advanceCursor(requestStartedAt)
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
