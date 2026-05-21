@@ -49,24 +49,18 @@ const CV_API_BASE = 'https://api.carbonvoice.app'
 const PAT                  = process.env.CV_PAT ?? ''
 const CONVERSATION_ID      = process.env.CV_CONVERSATION_ID ?? ''   // optional: scope to one conversation
 const REACTION_ID          = process.env.CV_REACTION_ID ?? ''       // optional: pin a specific reaction ID
-const ALLOWED_SENDERS      = process.env.CV_ALLOWED_SENDERS ?? ''   // optional: comma-separated list of allowed user IDs
-const IGNORED_SENDERS_LOG  = process.env.CV_IGNORED_SENDERS_LOG
-  ?? path.join(os.homedir(), '.claude', 'channels', 'cv', 'ignored-senders.log')
 const SEEN_TTL_MS          = Number(process.env.CV_SEEN_TTL_MS ?? 5 * 60 * 1_000)
 const POLL_INTERVAL_MS     = Number(process.env.CV_POLL_INTERVAL_MS  ?? 5_000)
 const WS_RETRY_MAX_MS      = Number(process.env.CV_WS_RETRY_MAX_MS   ?? 30_000)
 const STATE_PATH           = process.env.CV_STATE_PATH
   ?? path.join(os.homedir(), '.claude', 'channels', 'cv', `state${CONVERSATION_ID ? `-${CONVERSATION_ID}` : ''}.json`)
+const ACCESS_PATH          = process.env.CV_ACCESS_PATH
+  ?? path.join(os.homedir(), '.claude', 'channels', 'cv', 'access.json')
+const PROJECT_NAME         = process.env.CV_PROJECT_NAME ?? 'this project'
 
 if (!PAT) {
   process.stderr.write('cv-claude-channels: CV_PAT is required\n')
   process.exit(1)
-}
-
-// Parse allowed senders into a Set (empty set = no restriction)
-const allowedSenders = new Set(ALLOWED_SENDERS.split(',').map(s => s.trim()).filter(Boolean))
-if (allowedSenders.size > 0) {
-  process.stderr.write(`cv-claude-channels: sender gating enabled, ${allowedSenders.size} allowed senders\n`)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -74,6 +68,11 @@ if (allowedSenders.size > 0) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 type Mode = 'connecting' | 'websocket' | 'polling' | 'shutdown'
+
+interface Access {
+  allowFrom: string[]    // approved sender IDs; empty = deny all
+  blockedFrom: string[]  // permanently silenced sender IDs; no notification ever
+}
 
 interface State {
   mode: Mode
@@ -88,6 +87,9 @@ interface State {
   lastSeenAtDirty: boolean              // pending disk write
   flushTimer: ReturnType<typeof setTimeout> | null
   lastCVContext: { channelId: string; replyToId: string } | null  // for permission relay
+  access: Access                        // file-backed allowlist
+  unknownSenderSeen: Set<string>        // senders already notified this session (avoid spam)
+  pendingAllowContext: Map<string, { channelId: string; messageId: string }>  // context for allow confirmation
 }
 
 // Matches the actual CV REST API message shape
@@ -121,6 +123,9 @@ const state: State = {
   lastSeenAtDirty: false,
   flushTimer: null,
   lastCVContext: null,
+  access: { allowFrom: [], blockedFrom: [] },
+  unknownSenderSeen: new Set(),
+  pendingAllowContext: new Map(),
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -198,43 +203,170 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ['channel_id', 'reply_to_message_id', 'text'],
       },
     },
+    {
+      name: 'allow_sender',
+      description:
+        'Add a Carbon Voice user ID to the persistent allowlist so their messages ' +
+        'are forwarded to Claude. Use this when notified of an unknown sender attempting ' +
+        'to connect. The change takes effect immediately and survives server restarts.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          user_id: {
+            type: 'string',
+            description: 'The Carbon Voice user ID to add to the allowlist',
+          },
+        },
+        required: ['user_id'],
+      },
+    },
+    {
+      name: 'list_senders',
+      description:
+        'List all Carbon Voice user IDs on the allowlist and blocklist.',
+      inputSchema: {
+        type: 'object',
+        properties: {},
+        required: [],
+      },
+    },
+    {
+      name: 'remove_sender',
+      description:
+        'Remove a Carbon Voice user ID from the allowlist without blocking them. ' +
+        'They will be treated as an unknown sender again — Claude will be notified ' +
+        'if they message, and can re-allow them at that time.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          user_id: {
+            type: 'string',
+            description: 'The Carbon Voice user ID to remove from the allowlist',
+          },
+        },
+        required: ['user_id'],
+      },
+    },
+    {
+      name: 'block_sender',
+      description:
+        'Permanently silence a Carbon Voice user ID. Blocked senders are dropped ' +
+        'with no notification to Claude, even across server restarts. Use this to stop ' +
+        'repeated unknown-sender alerts from someone who should never have access.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          user_id: {
+            type: 'string',
+            description: 'The Carbon Voice user ID to block',
+          },
+        },
+        required: ['user_id'],
+      },
+    },
   ],
 }))
 
 mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
-  if (req.params.name !== 'send_message') {
-    throw new Error(`Unknown tool: ${req.params.name}`)
-  }
+  if (req.params.name === 'send_message') {
+    const { channel_id, reply_to_message_id, text } =
+      req.params.arguments as {
+        channel_id: string
+        reply_to_message_id: string
+        text: string
+      }
 
-  const { channel_id, reply_to_message_id, text } =
-    req.params.arguments as {
-      channel_id: string
-      reply_to_message_id: string
-      text: string
+    const unique_client_id = crypto.randomUUID()
+
+    const res = await cvFetch('POST', '/v3/messages/start', {
+      transcript: text,
+      is_text_message: true,
+      unique_client_id,
+      is_streaming: false,
+      channel_id,
+      reply_to_message_id,
+    })
+
+    if (!res.ok) {
+      const body = await res.text()
+      throw new Error(`CV send_message failed ${res.status}: ${body}`)
     }
 
-  const unique_client_id = crypto.randomUUID()
+    const data = await res.json() as { message_id?: string; id?: string }
+    const sent_id = data.message_id ?? data.id ?? '?'
 
-  const res = await cvFetch('POST', '/v3/messages/start', {
-    transcript: text,
-    is_text_message: true,
-    unique_client_id,
-    is_streaming: false,
-    channel_id,
-    reply_to_message_id,
-  })
-
-  if (!res.ok) {
-    const body = await res.text()
-    throw new Error(`CV send_message failed ${res.status}: ${body}`)
+    return {
+      content: [{ type: 'text', text: `sent: ${sent_id}` }],
+    }
   }
 
-  const data = await res.json() as { message_id?: string; id?: string }
-  const sent_id = data.message_id ?? data.id ?? '?'
+  if (req.params.name === 'allow_sender') {
+    const { user_id } = req.params.arguments as { user_id: string }
 
-  return {
-    content: [{ type: 'text', text: `sent: ${sent_id}` }],
+    state.access.blockedFrom = state.access.blockedFrom.filter(id => id !== user_id)
+    if (!state.access.allowFrom.includes(user_id)) {
+      state.access.allowFrom.push(user_id)
+    }
+    await saveAccess()
+    state.unknownSenderSeen.delete(user_id)
+    process.stderr.write(`cv-claude-channels: added ${user_id} to allowlist\n`)
+
+    const ctx = state.pendingAllowContext.get(user_id)
+    state.pendingAllowContext.delete(user_id)
+    if (ctx) {
+      cvFetch('POST', '/v3/messages/start', {
+        transcript: `You are now allowed to message Claude project \`${PROJECT_NAME}\` through this channel.`,
+        is_text_message: true,
+        unique_client_id: crypto.randomUUID(),
+        is_streaming: false,
+        channel_id: ctx.channelId,
+        reply_to_message_id: ctx.messageId,
+      }).catch(() => {})
+    }
+
+    return {
+      content: [{ type: 'text', text: `${user_id} added to allowlist. Their messages will now be forwarded to Claude.` }],
+    }
   }
+
+  if (req.params.name === 'list_senders') {
+    const allowed  = state.access.allowFrom.length  ? state.access.allowFrom.join(', ')  : '(none)'
+    const blocked  = state.access.blockedFrom.length ? state.access.blockedFrom.join(', ') : '(none)'
+    return {
+      content: [{ type: 'text', text: `Allowed: ${allowed}\nBlocked: ${blocked}` }],
+    }
+  }
+
+  if (req.params.name === 'remove_sender') {
+    const { user_id } = req.params.arguments as { user_id: string }
+
+    state.access.allowFrom = state.access.allowFrom.filter(id => id !== user_id)
+    await saveAccess()
+    state.unknownSenderSeen.delete(user_id)
+    process.stderr.write(`cv-claude-channels: removed ${user_id} from allowlist\n`)
+
+    return {
+      content: [{ type: 'text', text: `${user_id} removed from allowlist. They will be treated as an unknown sender if they message again.` }],
+    }
+  }
+
+  if (req.params.name === 'block_sender') {
+    const { user_id } = req.params.arguments as { user_id: string }
+
+    state.access.allowFrom = state.access.allowFrom.filter(id => id !== user_id)
+    if (!state.access.blockedFrom.includes(user_id)) {
+      state.access.blockedFrom.push(user_id)
+    }
+    await saveAccess()
+    state.unknownSenderSeen.add(user_id)  // suppress in-session notification too
+    process.stderr.write(`cv-claude-channels: blocked ${user_id}\n`)
+
+    return {
+      content: [{ type: 'text', text: `${user_id} blocked. Their messages will be silently dropped.` }],
+    }
+  }
+
+  throw new Error(`Unknown tool: ${req.params.name}`)
 })
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -260,8 +392,8 @@ const PermissionRequestSchema = z.object({
 // Handler for permission requests from Claude Code
 mcp.setNotificationHandler(PermissionRequestSchema, async ({ params }) => {
   // Don't relay permission requests for this server's own tools — approving
-  // send_message via send_message creates an unresolvable loop.
-  if (params.tool_name.endsWith('__send_message') || params.tool_name === 'send_message') return
+  // them via send_message creates an unresolvable loop.
+  if (['send_message', 'list_senders', 'allow_sender', 'remove_sender', 'block_sender'].some(t => params.tool_name === t || params.tool_name.endsWith(`__${t}`))) return
 
   const ctx = state.lastCVContext
   if (!ctx) {
@@ -305,27 +437,27 @@ function cvFetch(method: string, path: string, body?: unknown): Promise<Response
   })
 }
 
-const userNameCache = new Map<string, string>()
 
-async function resolveUserName(userId: string): Promise<string> {
-  if (userNameCache.has(userId)) return userNameCache.get(userId)!
+async function loadAccess() {
   try {
-    const res = await cvFetch('GET', `/v3/users/${userId}`)
-    if (res.ok) {
-      const data = await res.json() as { display_name?: string; username?: string; name?: string }
-      const name = data.display_name ?? data.username ?? data.name ?? userId
-      userNameCache.set(userId, name)
-      return name
-    }
-  } catch { /* fall through */ }
-  return userId
+    const raw = await fs.readFile(ACCESS_PATH, 'utf8')
+    const saved = JSON.parse(raw) as Partial<Access>
+    state.access.allowFrom = Array.isArray(saved.allowFrom) ? saved.allowFrom : []
+    state.access.blockedFrom = Array.isArray(saved.blockedFrom) ? saved.blockedFrom : []
+    process.stderr.write(`cv-claude-channels: allowlist loaded (${state.access.allowFrom.length} allowed, ${state.access.blockedFrom.length} blocked)\n`)
+  } catch {
+    // first run — no access file yet; empty allowlist means deny all
+    process.stderr.write('cv-claude-channels: no access file found — all senders denied until added\n')
+  }
 }
 
-async function logIgnoredSender(userId: string): Promise<void> {
-  const username = await resolveUserName(userId)
-  const entry = JSON.stringify({ time: new Date().toISOString(), userId, username }) + '\n'
-  await fs.mkdir(path.dirname(IGNORED_SENDERS_LOG), { recursive: true })
-  await fs.appendFile(IGNORED_SENDERS_LOG, entry, 'utf8')
+async function saveAccess() {
+  try {
+    await fs.mkdir(path.dirname(ACCESS_PATH), { recursive: true })
+    await fs.writeFile(ACCESS_PATH, JSON.stringify(state.access, null, 2), { encoding: 'utf8', mode: 0o600 })
+  } catch (e) {
+    process.stderr.write(`cv-claude-channels: failed to save access file: ${e}\n`)
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -388,13 +520,16 @@ async function startup() {
     process.stderr.write(`cv-claude-channels: authenticated as ${state.ownUserId}\n`)
   }
 
-  // 2. Resolve reaction ID
+  // 2. Load allowlist from disk
+  await loadAccess()
+
+  // 3. Resolve reaction ID
   await loadReaction()
 
-  // 3. Restore cursor from disk
+  // 4. Restore cursor from disk
   await loadState()
 
-  // 4. Connect
+  // 5. Connect
   await connectWithResilience()
 }
 
@@ -483,10 +618,41 @@ async function processMessage(event: CVMessageEvent): Promise<boolean | null> {
   // Filter self
   if (event.creator_id === state.ownUserId) return false
 
-  // Sender gating: check allowlist before processing
-  if (allowedSenders.size > 0 && !allowedSenders.has(event.creator_id)) {
-    process.stderr.write(`cv-claude-channels: dropped message from unauthorized sender ${event.creator_id}\n`)
-    logIgnoredSender(event.creator_id).catch(() => {})
+  // Blocked senders are dropped silently with no notification
+  if (state.access.blockedFrom.includes(event.creator_id)) return false
+
+  // Sender gating: deny all senders not in the allowlist
+  if (!state.access.allowFrom.includes(event.creator_id)) {
+    process.stderr.write(`cv-claude-channels: dropped message from unknown sender ${event.creator_id}\n`)
+    // Notify Claude Code once per sender per session so the user can decide to allow them
+    if (!state.unknownSenderSeen.has(event.creator_id)) {
+      state.unknownSenderSeen.add(event.creator_id)
+      state.pendingAllowContext.set(event.creator_id, { channelId: channel_id, messageId: event.message_id })
+      mcp.notification({
+        method: 'notifications/claude/channel',
+        params: {
+          content:
+            `Unknown sender (userId: ${event.creator_id}) attempting to message through Carbon Voice.\n\n` +
+            `To add them to the allowlist, call the allow_sender tool with this user ID.`,
+          meta: {
+            source: 'carbon-voice',
+            event: 'unknown_sender',
+            sender_id: event.creator_id,
+          },
+        },
+      }).catch(() => {})
+
+      if (state.access.allowFrom.length === 0) {
+        cvFetch('POST', '/v3/messages/start', {
+          transcript: 'Allow Sender list is currently empty. Go to Claude to approve senders.',
+          is_text_message: true,
+          unique_client_id: crypto.randomUUID(),
+          is_streaming: false,
+          channel_id: event.channel_ids[0],
+          reply_to_message_id: event.message_id,
+        }).catch(() => {})
+      }
+    }
     return false
   }
 

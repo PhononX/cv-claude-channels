@@ -80,8 +80,6 @@ npm start
 
 - `CV_CONVERSATION_ID` - Scope to a specific conversation (omit to receive all)
 - `CV_REACTION_ID` - Specific reaction ID to add on message receipt
-- `CV_ALLOWED_SENDERS` - Comma-separated list of allowed user IDs (for sender gating)
-- `CV_IGNORED_SENDERS_LOG` - Path to log file for ignored sender attempts (default: `~/.claude/channels/cv/ignored-senders.log`)
 - `CV_SEEN_TTL_MS` - Deduplication TTL in milliseconds (default: 5 minutes)
 - `CV_POLL_INTERVAL_MS` - Polling interval in milliseconds (default: 5 seconds)
 - `CV_WS_RETRY_MAX_MS` - Max WebSocket retry backoff in milliseconds (default: 30 seconds)
@@ -128,18 +126,34 @@ Reply with `yes <request_id>` or `no <request_id>` to approve or deny.
 
 ### Sender Gating
 
-To restrict which users can send messages, set `CV_ALLOWED_SENDERS`:
+All senders are denied by default. Use the `allow_sender` and `block_sender` tools at runtime to manage access. The allowlist is persisted to disk and survives server restarts. Unauthorized messages are dropped silently (no feedback to sender) to prevent prompt injection.
 
-```json
-{
-  "env": {
-    "CV_PAT": "your-token",
-    "CV_ALLOWED_SENDERS": "user-id-1,user-id-2"
-  }
-}
+If the allowlist is completely empty and someone messages in, they'll receive a reply in Carbon Voice: *"Allow Sender list is currently empty. Go to Claude to approve senders."*
+
+**Adding a sender**
+
+When an unknown user tries to send a message, Claude receives a notification:
+
+```
+Unknown sender attempting to message through Carbon Voice.
+Sender ID: <user-id>
+
+To add them to the allowlist, call the allow_sender tool with this user ID.
 ```
 
-Unauthorized messages are dropped silently (no feedback to sender) to prevent prompt injection.
+Ask Claude to allow them:
+
+> Allow sender \<user-id\>
+
+Claude will call `allow_sender` with that user ID. Their messages will be forwarded immediately and on all future sessions.
+
+**Blocking a sender**
+
+Ask Claude to block them:
+
+> Block sender \<user-id\>
+
+Claude will call `block_sender`. That user will be permanently silenced, even if they were previously allowed.
 
 ### Permission Relay
 
