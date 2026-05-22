@@ -43,17 +43,28 @@ export interface Reaction {
   image_url: string
 }
 
+export interface AttachmentPayload {
+  type: 'link'
+  link: string
+  idempotency_key?: string
+  filename?: string
+  mime_type?: string
+  length_in_bytes?: number
+  status?: string
+  percent_complete?: number
+}
+
 export interface SendMessageBody {
+  idempotency_key: string
+  conversation_id: string
+  thread_id: string
   transcript: string
-  is_text_message: boolean
-  unique_client_id: string
-  is_streaming: boolean
-  channel_id: string
-  reply_to_message_id: string
+  attachments?: AttachmentPayload[]
 }
 
 export interface AttachmentRecord {
-  _id: string
+  _id?: string
+  id?: string
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -123,13 +134,15 @@ export async function markRead(channelId: string, messageId: string): Promise<vo
 // MESSAGES
 // ─────────────────────────────────────────────────────────────────────────────
 
-export async function sendMessage(body: SendMessageBody): Promise<{ message_id?: string; id?: string }> {
-  const res = await cvFetch('POST', '/v3/messages/start', body)
+export async function sendMessage(
+  body: SendMessageBody,
+): Promise<{ message_id?: string; id?: string; attachments?: AttachmentRecord[] }> {
+  const res = await cvFetch('POST', '/v5/messages/text', body)
   if (!res.ok) {
     const text = await res.text()
     throw new Error(`CV sendMessage failed ${res.status}: ${text}`)
   }
-  return res.json() as Promise<{ message_id?: string; id?: string }>
+  return res.json() as Promise<{ message_id?: string; id?: string; attachments?: AttachmentRecord[] }>
 }
 
 export async function getRecentMessages(params: {
@@ -169,19 +182,6 @@ export async function uploadToS3(url: string, filePath: string, mime_type: strin
   if (!res.ok) throw new Error(`S3 upload failed ${res.status}`)
 }
 
-export async function postAttachments(
-  messageId: string,
-  attachments: unknown[],
-): Promise<AttachmentRecord[]> {
-  const res = await cvFetch('POST', `/messages/${messageId}/attachments`, { attachments })
-  if (!res.ok) {
-    const body = await res.text()
-    throw new Error(`CV postAttachments failed ${res.status}: ${body}`)
-  }
-  const data = await res.json() as unknown
-  _log(`cv-claude-channels: POST attachments response: ${JSON.stringify(data)}\n`)
-  return Array.isArray(data) ? (data as AttachmentRecord[]) : []
-}
 
 export async function updateAttachment(
   messageId: string,
