@@ -34,22 +34,27 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js'
 import { z } from 'zod'
-import { io, Socket } from 'socket.io-client'
 import * as fs from 'node:fs/promises'
 import * as path from 'node:path'
 import * as os from 'node:os'
 import * as crypto from 'node:crypto'
+import {
+  init as initApi,
+  whoami, getReactions, addReaction, markRead,
+  sendMessage, getRecentMessages,
+  getSignedUrl, uploadToS3, postAttachments, updateAttachment, resolveActualPath,
+  createConnection,
+  type CVConnection,
+  type CVMessageEvent,
+} from './cv-api.js'
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CONFIG
 // ─────────────────────────────────────────────────────────────────────────────
 
-const CV_API_BASE = 'https://api.carbonvoice.app'
-
 const PAT                  = process.env.CV_PAT ?? ''
 const CONVERSATION_ID      = process.env.CV_CONVERSATION_ID ?? ''   // optional: scope to one conversation
 const REACTION_ID          = process.env.CV_REACTION_ID ?? ''       // optional: pin a specific reaction ID
-const SEEN_TTL_MS          = Number(process.env.CV_SEEN_TTL_MS ?? 5 * 60 * 1_000)
 const POLL_INTERVAL_MS     = Number(process.env.CV_POLL_INTERVAL_MS  ?? 5_000)
 const WS_RETRY_MAX_MS      = Number(process.env.CV_WS_RETRY_MAX_MS   ?? 30_000)
 const STATE_PATH           = process.env.CV_STATE_PATH
@@ -57,17 +62,25 @@ const STATE_PATH           = process.env.CV_STATE_PATH
 const ACCESS_PATH          = process.env.CV_ACCESS_PATH
   ?? path.join(os.homedir(), '.claude', 'channels', 'cv', 'access.json')
 const PROJECT_NAME         = process.env.CV_PROJECT_NAME ?? 'this project'
+const LOG_FILE             = process.env.CV_LOG_FILE ?? ''
+
+const log = LOG_FILE
+  ? (msg: string) => {
+      fs.appendFile(LOG_FILE, msg).catch(() => {})
+      process.stderr.write(msg)
+    }
+  : (msg: string) => process.stderr.write(msg)
 
 if (!PAT) {
-  process.stderr.write('cv-claude-channels: CV_PAT is required\n')
+  log('cv-claude-channels: CV_PAT is required\n')
   process.exit(1)
 }
+
+initApi({ pat: PAT, log })
 
 // ─────────────────────────────────────────────────────────────────────────────
 // TYPES
 // ─────────────────────────────────────────────────────────────────────────────
-
-type Mode = 'connecting' | 'websocket' | 'polling' | 'shutdown'
 
 interface Access {
   allowFrom: string[]    // approved sender IDs; empty = deny all
@@ -75,58 +88,41 @@ interface Access {
 }
 
 interface State {
-  mode: Mode
-  lastSeenAt: string | null             // null = never fetched; set to now on first poll
+  lastCheckedAt: string | null             // null = never fetched; set to now on first poll
   ownUserId: string                     // used to filter self-messages
   reactionId: string | null             // reaction to add on receipt; null until resolved
-  wsSocket: Socket | null              // active Socket.IO connection, if any
-  wsRetryBackoff: number                // current backoff in ms
-  wsRetryTimer: ReturnType<typeof setTimeout> | null
-  pollTimer: ReturnType<typeof setTimeout> | null
-  recentlySeen: Map<string, number>     // message_id → expiry epoch ms
-  lastSeenAtDirty: boolean              // pending disk write
+  fetchInFlight: boolean                 // coalescing guard: fetch currently running
+  fetchQueued: boolean                   // coalescing guard: another fetch waiting
+  lastCheckedAtDirty: boolean              // pending disk write
   flushTimer: ReturnType<typeof setTimeout> | null
   lastCVContext: { channelId: string; replyToId: string } | null  // for permission relay
   access: Access                        // file-backed allowlist
   unknownSenderSeen: Set<string>        // senders already notified this session (avoid spam)
   pendingAllowContext: Map<string, { channelId: string; messageId: string }>  // context for allow confirmation
+  cvStarted: boolean                    // true once startup() has been called
 }
 
-// Matches the actual CV REST API message shape
-interface CVTimecode { t: string; s: number; e: number }
-
-interface CVMessageEvent {
-  message_id: string
-  channel_ids: string[]
-  creator_id: string
-  text_models: Array<{ type: string; value: string; timecodes?: CVTimecode[] }>
-  parent_message_id: string | null
-  created_at: string
-  is_text_message: boolean
-  status: string
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // STATE
 // ─────────────────────────────────────────────────────────────────────────────
 
 const state: State = {
-  mode: 'connecting',
-  lastSeenAt: null,
+  lastCheckedAt: null,
   ownUserId: process.env.CV_OWN_USER_ID ?? '',
   reactionId: REACTION_ID || 'acknowledged',
-  wsSocket: null,
-  wsRetryBackoff: 1_000,
-  wsRetryTimer: null,
-  pollTimer: null,
-  recentlySeen: new Map<string, number>(),
-  lastSeenAtDirty: false,
+  fetchInFlight: false,
+  fetchQueued: false,
+  lastCheckedAtDirty: false,
   flushTimer: null,
   lastCVContext: null,
   access: { allowFrom: [], blockedFrom: [] },
   unknownSenderSeen: new Set(),
   pendingAllowContext: new Map(),
+  cvStarted: false,
 }
+
+let connection: CVConnection | null = null
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MCP SERVER
@@ -165,6 +161,11 @@ Never reply to a reply — always use reply_to_id which already handles threadin
 
 Permission prompts may arrive asking you to approve tool usage. Reply with
 "yes <request_id>" or "no <request_id>" to grant or deny permission.
+
+IMPORTANT — Startup check: when a <channel> tag has event="startup_check" in its
+attributes, you MUST immediately call the confirm_channels tool (no arguments needed).
+Do not send any text response. Do not call send_message. Only call confirm_channels.
+This is required to activate the Carbon Voice connection.
     `.trim(),
   },
 )
@@ -181,7 +182,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         'Send a text reply into a Carbon Voice conversation. Carbon Voice ' +
         'automatically converts the text to audio and delivers it to all ' +
         'participants. Use channel_id and reply_to_message_id from the ' +
-        '<channel> tag.',
+        '<channel> tag. Optionally include attachments (links or files).',
       inputSchema: {
         type: 'object',
         properties: {
@@ -198,6 +199,34 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           text: {
             type: 'string',
             description: "The text content of Claude's reply. CV converts it to audio.",
+          },
+          attachments: {
+            type: 'array',
+            description: 'Optional list of attachments to include with the message.',
+            items: {
+              oneOf: [
+                {
+                  type: 'object',
+                  description: 'A link attachment.',
+                  properties: {
+                    type: { type: 'string', enum: ['link'] },
+                    link: { type: 'string', description: 'The URL to attach.' },
+                  },
+                  required: ['type', 'link'],
+                },
+                {
+                  type: 'object',
+                  description: 'A file attachment. The server uploads the file and resolves the URL.',
+                  properties: {
+                    type: { type: 'string', enum: ['file'] },
+                    path: { type: 'string', description: 'Absolute path to the local file to attach.' },
+                    filename: { type: 'string', description: 'The display filename (e.g. "document.pdf").' },
+                    mime_type: { type: 'string', description: 'The MIME type (e.g. "application/pdf").' },
+                  },
+                  required: ['type', 'path', 'filename', 'mime_type'],
+                },
+              ],
+            },
           },
         },
         required: ['channel_id', 'reply_to_message_id', 'text'],
@@ -264,36 +293,100 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ['user_id'],
       },
     },
+    {
+      name: 'confirm_channels',
+      description:
+        'Activates the Carbon Voice connection. Call this at startup when prompted, ' +
+        'or manually to connect at any time.',
+      inputSchema: {
+        type: 'object',
+        properties: {},
+        required: [],
+      },
+    },
   ],
 }))
 
 mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   if (req.params.name === 'send_message') {
-    const { channel_id, reply_to_message_id, text } =
+    type LinkAttachment = { type: 'link'; link: string }
+    type FileAttachment = { type: 'file'; path: string; filename: string; mime_type: string }
+    type Attachment = LinkAttachment | FileAttachment
+
+    const { channel_id, reply_to_message_id, text, attachments } =
       req.params.arguments as {
         channel_id: string
         reply_to_message_id: string
         text: string
+        attachments?: Attachment[]
       }
 
-    const unique_client_id = crypto.randomUUID()
+    const allAttachments = attachments ?? []
+    const fileInputs = allAttachments.filter((a): a is FileAttachment => a.type === 'file')
 
-    const res = await cvFetch('POST', '/v3/messages/start', {
+    // Resolve relative paths against cwd, then fix unicode space variants in filenames
+    const resolvedFileInputs = await Promise.all(fileInputs.map(async a => {
+      const abs = path.isAbsolute(a.path) ? a.path : path.resolve(process.cwd(), a.path)
+      return { ...a, path: await resolveActualPath(abs) }
+    }))
+
+    const linkPayloads = allAttachments
+      .filter((a): a is LinkAttachment => a.type === 'link')
+      .map(a => ({ type: 'link' as const, link: a.link }))
+
+    // Step 1: get signed URLs and kick off S3 uploads before creating the message
+    const signedUrls = resolvedFileInputs.length > 0
+      ? await Promise.all(resolvedFileInputs.map(a => getSignedUrl(a.filename, a.mime_type)))
+      : []
+    // Strip query params — CV stores the base URL, not the signed one
+    const baseUrls = signedUrls.map(u => u.split('?')[0])
+    const s3Uploads = resolvedFileInputs.map((a, i) => uploadToS3(signedUrls[i], a.path, a.mime_type))
+    // Suppress unhandled-rejection warnings in case the handler throws before step 4 can await these.
+    s3Uploads.forEach(p => p.catch(() => {}))
+
+    // Step 2: create the message
+    const data = await sendMessage({
       transcript: text,
       is_text_message: true,
-      unique_client_id,
+      unique_client_id: crypto.randomUUID(),
       is_streaming: false,
       channel_id,
       reply_to_message_id,
     })
-
-    if (!res.ok) {
-      const body = await res.text()
-      throw new Error(`CV send_message failed ${res.status}: ${body}`)
-    }
-
-    const data = await res.json() as { message_id?: string; id?: string }
     const sent_id = data.message_id ?? data.id ?? '?'
+
+    if (allAttachments.length > 0) {
+      const filePayloads = resolvedFileInputs.map((a, i) => ({
+        type: 'file' as const,
+        link: baseUrls[i],
+        filename: a.filename,
+        mime_type: a.mime_type,
+        status: 'Initializing',
+        percent_complete: 0,
+      }))
+
+      // Step 3: POST all attachments immediately — files show as Initializing
+      const attachedRecords = await postAttachments(sent_id, [...linkPayloads, ...filePayloads])
+
+      // Step 4: finish uploads and mark Uploaded in the background — don't block the tool response
+      Promise.all(s3Uploads.map(async (upload, i) => {
+        await upload
+        log(`cv-claude-channels: S3 upload complete for file[${i}] ${resolvedFileInputs[i].filename}\n`)
+        const attachmentId = attachedRecords[linkPayloads.length + i]?._id
+        if (!attachmentId) {
+          log(`cv-claude-channels: no attachment ID for file[${i}] — skipping PUT\n`)
+          return
+        }
+        await updateAttachment(sent_id, attachmentId, {
+          type: 'file',
+          link: baseUrls[i],
+          filename: resolvedFileInputs[i].filename,
+          mime_type: resolvedFileInputs[i].mime_type,
+          status: 'Uploaded',
+          percent_complete: 100,
+        })
+      })).catch(err => log(`cv-claude-channels: background upload error: ${err}\n`))
+    }
 
     return {
       content: [{ type: 'text', text: `sent: ${sent_id}` }],
@@ -309,12 +402,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     }
     await saveAccess()
     state.unknownSenderSeen.delete(user_id)
-    process.stderr.write(`cv-claude-channels: added ${user_id} to allowlist\n`)
+    log(`cv-claude-channels: added ${user_id} to allowlist\n`)
 
     const ctx = state.pendingAllowContext.get(user_id)
     state.pendingAllowContext.delete(user_id)
     if (ctx) {
-      cvFetch('POST', '/v3/messages/start', {
+      sendMessage({
         transcript: `You are now allowed to message Claude project \`${PROJECT_NAME}\` through this channel.`,
         is_text_message: true,
         unique_client_id: crypto.randomUUID(),
@@ -343,7 +436,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     state.access.allowFrom = state.access.allowFrom.filter(id => id !== user_id)
     await saveAccess()
     state.unknownSenderSeen.delete(user_id)
-    process.stderr.write(`cv-claude-channels: removed ${user_id} from allowlist\n`)
+    log(`cv-claude-channels: removed ${user_id} from allowlist\n`)
 
     return {
       content: [{ type: 'text', text: `${user_id} removed from allowlist. They will be treated as an unknown sender if they message again.` }],
@@ -359,11 +452,21 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     }
     await saveAccess()
     state.unknownSenderSeen.add(user_id)  // suppress in-session notification too
-    process.stderr.write(`cv-claude-channels: blocked ${user_id}\n`)
+    log(`cv-claude-channels: blocked ${user_id}\n`)
 
     return {
       content: [{ type: 'text', text: `${user_id} blocked. Their messages will be silently dropped.` }],
     }
+  }
+
+  if (req.params.name === 'confirm_channels') {
+    if (state.cvStarted) {
+      return { content: [{ type: 'text', text: 'Carbon Voice already connected.' }] }
+    }
+    state.cvStarted = true
+    log('cv-claude-channels: confirm_channels called — connecting to Carbon Voice\n')
+    startup().catch(err => log(`cv-claude-channels: startup error: ${err}\n`))
+    return { content: [{ type: 'text', text: 'Channels confirmed and active.' }] }
   }
 
   throw new Error(`Unknown tool: ${req.params.name}`)
@@ -393,11 +496,11 @@ const PermissionRequestSchema = z.object({
 mcp.setNotificationHandler(PermissionRequestSchema, async ({ params }) => {
   // Don't relay permission requests for this server's own tools — approving
   // them via send_message creates an unresolvable loop.
-  if (['send_message', 'list_senders', 'allow_sender', 'remove_sender', 'block_sender'].some(t => params.tool_name === t || params.tool_name.endsWith(`__${t}`))) return
+  if (['send_message', 'list_senders', 'allow_sender', 'remove_sender', 'block_sender', 'confirm_channels'].some(t => params.tool_name === t || params.tool_name.endsWith(`__${t}`))) return
 
   const ctx = state.lastCVContext
   if (!ctx) {
-    process.stderr.write(`cv-claude-channels: permission request for ${params.tool_name} but no CV context to relay to\n`)
+    log(`cv-claude-channels: permission request for ${params.tool_name} but no CV context to relay to\n`)
     return
   }
 
@@ -405,37 +508,20 @@ mcp.setNotificationHandler(PermissionRequestSchema, async ({ params }) => {
     `Claude wants to run ${params.tool_name}: ${params.description}\n\n` +
     `Reply "yes ${params.request_id}" or "no ${params.request_id}" to grant or deny permission.`
 
-  const unique_client_id = crypto.randomUUID()
-  const res = await cvFetch('POST', '/v3/messages/start', {
-    transcript: text,
-    is_text_message: true,
-    unique_client_id,
-    is_streaming: false,
-    channel_id: ctx.channelId,
-    reply_to_message_id: ctx.replyToId,
-  })
-
-  if (!res.ok) {
-    process.stderr.write(`cv-claude-channels: permission relay send failed ${res.status} for ${params.request_id}\n`)
-  } else {
-    process.stderr.write(`cv-claude-channels: permission request for ${params.tool_name} relayed to CV (request_id=${params.request_id})\n`)
+  try {
+    await sendMessage({
+      transcript: text,
+      is_text_message: true,
+      unique_client_id: crypto.randomUUID(),
+      is_streaming: false,
+      channel_id: ctx.channelId,
+      reply_to_message_id: ctx.replyToId,
+    })
+    log(`cv-claude-channels: permission request for ${params.tool_name} relayed to CV (request_id=${params.request_id})\n`)
+  } catch (err) {
+    log(`cv-claude-channels: permission relay send failed for ${params.request_id}: ${err}\n`)
   }
 })
-
-// ─────────────────────────────────────────────────────────────────────────────
-// CV API HELPERS
-// ─────────────────────────────────────────────────────────────────────────────
-
-function cvFetch(method: string, path: string, body?: unknown): Promise<Response> {
-  return fetch(`${CV_API_BASE}${path}`, {
-    method,
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${PAT}`,
-    },
-    body: body !== undefined ? JSON.stringify(body) : undefined,
-  })
-}
 
 
 async function loadAccess() {
@@ -444,10 +530,10 @@ async function loadAccess() {
     const saved = JSON.parse(raw) as Partial<Access>
     state.access.allowFrom = Array.isArray(saved.allowFrom) ? saved.allowFrom : []
     state.access.blockedFrom = Array.isArray(saved.blockedFrom) ? saved.blockedFrom : []
-    process.stderr.write(`cv-claude-channels: allowlist loaded (${state.access.allowFrom.length} allowed, ${state.access.blockedFrom.length} blocked)\n`)
+    log(`cv-claude-channels: allowlist loaded (${state.access.allowFrom.length} allowed, ${state.access.blockedFrom.length} blocked)\n`)
   } catch {
     // first run — no access file yet; empty allowlist means deny all
-    process.stderr.write('cv-claude-channels: no access file found — all senders denied until added\n')
+    log('cv-claude-channels: no access file found — all senders denied until added\n')
   }
 }
 
@@ -456,7 +542,7 @@ async function saveAccess() {
     await fs.mkdir(path.dirname(ACCESS_PATH), { recursive: true })
     await fs.writeFile(ACCESS_PATH, JSON.stringify(state.access, null, 2), { encoding: 'utf8', mode: 0o600 })
   } catch (e) {
-    process.stderr.write(`cv-claude-channels: failed to save access file: ${e}\n`)
+    log(`cv-claude-channels: failed to save access file: ${e}\n`)
   }
 }
 
@@ -464,46 +550,36 @@ async function saveAccess() {
 // REACTIONS
 // ─────────────────────────────────────────────────────────────────────────────
 
-interface Reaction { id: string; name: string; code: string; reaction_tts: string; image_url: string }
-
 async function loadReaction() {
-  const res = await cvFetch('GET', '/reactions')
-  if (!res.ok) {
-    process.stderr.write(`cv-claude-channels: GET /reactions failed ${res.status}\n`)
+  const reactions = await getReactions()
+  if (reactions.length === 0) {
+    log('cv-claude-channels: no reactions available\n')
     return
   }
 
-  const reactions = await res.json() as Reaction[]
-  if (!Array.isArray(reactions) || reactions.length === 0) {
-    process.stderr.write('cv-claude-channels: no reactions available\n')
-    return
-  }
-
-  // Always log available reactions so the user can pin one via CV_REACTION_ID
-  process.stderr.write('cv-claude-channels: available reactions:\n')
+  log('cv-claude-channels: available reactions:\n')
   for (const r of reactions) {
-    process.stderr.write(`  id=${r.id}  name="${r.name}"  code="${r.code}"\n`)
+    log(`  id=${r.id}  name="${r.name}"  code="${r.code}"\n`)
   }
 
-  process.stderr.write(`cv-claude-channels: using reaction id=${state.reactionId}\n`)
-}
-
-async function addReaction(messageId: string) {
-  if (!state.reactionId) return
-  const res = await cvFetch('POST', `/reactions/${state.reactionId}/${messageId}`)
-  if (!res.ok) {
-    process.stderr.write(`cv-claude-channels: addReaction failed ${res.status} for ${messageId}\n`)
+  // Resolve code/name → actual UUID if the configured value isn't already a known ID.
+  // top_user_reactions stores the UUID, so the check in isProcessed must compare UUIDs.
+  if (state.reactionId) {
+    const byId = reactions.find(r => r.id === state.reactionId)
+    if (!byId) {
+      const byCode = reactions.find(
+        r => r.code === state.reactionId || r.name.toLowerCase() === state.reactionId!.toLowerCase(),
+      )
+      if (byCode) {
+        log(`cv-claude-channels: resolved reaction "${state.reactionId}" → id="${byCode.id}"\n`)
+        state.reactionId = byCode.id
+      } else {
+        log(`cv-claude-channels: WARNING: reaction "${state.reactionId}" not found — isProcessed checks will always miss\n`)
+      }
+    }
   }
-}
 
-async function markRead(channelId: string, messageId: string) {
-  const res = await cvFetch(
-    'DELETE',
-    `/notifications/${channelId}/${messageId}?type=message&notification_removal_mode=hard`,
-  )
-  if (!res.ok) {
-    process.stderr.write(`cv-claude-channels: markRead failed ${res.status} for ${messageId}\n`)
-  }
+  log(`cv-claude-channels: using reaction id=${state.reactionId}\n`)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -513,11 +589,8 @@ async function markRead(channelId: string, messageId: string) {
 async function startup() {
   // 1. Resolve own user ID (needed to filter self-messages)
   if (!state.ownUserId) {
-    const res = await cvFetch('GET', '/whoami')
-    if (!res.ok) throw new Error(`/whoami failed: ${res.status}`)
-    const data = await res.json() as { user: { user_guid: string } }
-    state.ownUserId = data.user.user_guid
-    process.stderr.write(`cv-claude-channels: authenticated as ${state.ownUserId}\n`)
+    state.ownUserId = await whoami()
+    log(`cv-claude-channels: authenticated as ${state.ownUserId}\n`)
   }
 
   // 2. Load allowlist from disk
@@ -530,7 +603,14 @@ async function startup() {
   await loadState()
 
   // 5. Connect
-  await connectWithResilience()
+  connection = createConnection(
+    { conversationId: CONVERSATION_ID, pollIntervalMs: POLL_INTERVAL_MS, wsRetryMaxMs: WS_RETRY_MAX_MS },
+    {
+      onMessageActivity: fetchMissedMessages,
+      onOwnUserId: (uid) => { if (!state.ownUserId) state.ownUserId = uid },
+    },
+  )
+  await connection.connect()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -540,10 +620,11 @@ async function startup() {
 async function loadState() {
   try {
     const raw = await fs.readFile(STATE_PATH, 'utf8')
-    const saved = JSON.parse(raw) as { lastSeenAt?: string }
-    if (saved.lastSeenAt) {
-      state.lastSeenAt = saved.lastSeenAt
-      process.stderr.write(`cv-claude-channels: resuming from ${state.lastSeenAt}\n`)
+    const saved = JSON.parse(raw) as { lastCheckedAt?: string; lastSeenAt?: string }
+    const cursor = saved.lastCheckedAt ?? saved.lastSeenAt
+    if (cursor) {
+      state.lastCheckedAt = cursor
+      log(`cv-claude-channels: resuming from ${state.lastCheckedAt}\n`)
     }
   } catch {
     // first run — no state file yet
@@ -551,17 +632,17 @@ async function loadState() {
 }
 
 async function flushState() {
-  if (!state.lastSeenAtDirty || state.lastSeenAt === null) return
+  if (!state.lastCheckedAtDirty || state.lastCheckedAt === null) return
   try {
     await fs.mkdir(path.dirname(STATE_PATH), { recursive: true })
     await fs.writeFile(
       STATE_PATH,
-      JSON.stringify({ lastSeenAt: state.lastSeenAt }, null, 2),
+      JSON.stringify({ lastCheckedAt: state.lastCheckedAt }, null, 2),
       'utf8',
     )
-    state.lastSeenAtDirty = false
+    state.lastCheckedAtDirty = false
   } catch (e) {
-    process.stderr.write(`cv-claude-channels: failed to flush state: ${e}\n`)
+    log(`cv-claude-channels: failed to flush state: ${e}\n`)
   }
 }
 
@@ -574,9 +655,10 @@ function scheduleFlush() {
   }, 5_000)
 }
 
-function advanceCursor(isoTimestamp: string) {
-  state.lastSeenAt = isoTimestamp
-  state.lastSeenAtDirty = true
+function updateCursor(isoTimestamp: string) {
+  log(`cv-claude-channels: updateCursor ${state.lastCheckedAt} → ${isoTimestamp}\n`)
+  state.lastCheckedAt = isoTimestamp
+  state.lastCheckedAtDirty = true
   scheduleFlush()
 }
 
@@ -584,26 +666,20 @@ function advanceCursor(isoTimestamp: string) {
 // DEDUPLICATION
 // ─────────────────────────────────────────────────────────────────────────────
 
-
-function isRecentlySeen(messageId: string): boolean {
-  const expiry = state.recentlySeen.get(messageId)
-  if (expiry === undefined) return false
-  if (Date.now() > expiry) {
-    state.recentlySeen.delete(messageId)
-    return false
-  }
-  return true
+// The reaction is our sole processed marker — it lives on the server and survives restarts.
+function isProcessed(event: CVMessageEvent): boolean {
+  if (!state.reactionId) return false
+  return event.reaction_summary?.top_user_reactions?.some(
+    r => r.user_id === state.ownUserId && r.reaction_id === state.reactionId,
+  ) ?? false
 }
 
-function markSeen(messageId: string) {
-  state.recentlySeen.set(messageId, Date.now() + SEEN_TTL_MS)
-  // Prune expired entries periodically (every 100 insertions)
-  if (state.recentlySeen.size % 100 === 0) {
-    const now = Date.now()
-    for (const [id, expiry] of state.recentlySeen) {
-      if (now > expiry) state.recentlySeen.delete(id)
-    }
+async function markProcessed(event: CVMessageEvent): Promise<void> {
+  if (isProcessed(event)) {
+    log(`cv-claude-channels: WARNING double-process on ${event.message_id} — reaction already present, skipping addReaction\n`)
+    return
   }
+  if (state.reactionId) await addReaction(state.reactionId, event.message_id)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -623,7 +699,7 @@ async function processMessage(event: CVMessageEvent): Promise<boolean | null> {
 
   // Sender gating: deny all senders not in the allowlist
   if (!state.access.allowFrom.includes(event.creator_id)) {
-    process.stderr.write(`cv-claude-channels: dropped message from unknown sender ${event.creator_id}\n`)
+    log(`cv-claude-channels: dropped message from unknown sender ${event.creator_id}\n`)
     // Notify Claude Code once per sender per session so the user can decide to allow them
     if (!state.unknownSenderSeen.has(event.creator_id)) {
       state.unknownSenderSeen.add(event.creator_id)
@@ -643,7 +719,7 @@ async function processMessage(event: CVMessageEvent): Promise<boolean | null> {
       }).catch(() => {})
 
       if (state.access.allowFrom.length === 0) {
-        cvFetch('POST', '/v3/messages/start', {
+        sendMessage({
           transcript: 'Allow Sender list is currently empty. Go to Claude to approve senders.',
           is_text_message: true,
           unique_client_id: crypto.randomUUID(),
@@ -656,8 +732,8 @@ async function processMessage(event: CVMessageEvent): Promise<boolean | null> {
     return false
   }
 
-  // Deduplicate — only after confirming the message is ready
-  if (isRecentlySeen(event.message_id)) return false
+  // Reaction is our server-side processed marker — survives restarts
+  if (isProcessed(event)) return false
 
   // Transcript lives in timecodes[].t joined; value field is always empty
   const tm = event.text_models.find(
@@ -666,9 +742,12 @@ async function processMessage(event: CVMessageEvent): Promise<boolean | null> {
   const transcript = tm?.timecodes?.map(tc => tc.t).join(' ') || tm?.value || ''
 
   // Log what we see so field-name issues are visible in stderr
-  process.stderr.write(
+  log(
     `cv-claude-channels: message ${event.message_id} status=${event.status} transcript="${transcript.slice(0, 80)}"\n`,
   )
+
+  // Terminal statuses will never produce a transcript — skip them
+  if (!transcript && (event.status === 'canceled' || event.status === 'deleted')) return false
 
   // Not ready yet — let the next poll retry without marking seen
   if (!transcript) return null
@@ -680,7 +759,7 @@ async function processMessage(event: CVMessageEvent): Promise<boolean | null> {
   if (permMatch) {
     const verdict = permMatch[1].toLowerCase().startsWith('y') ? 'allow' : 'deny'
     const requestId = permMatch[2].toLowerCase()
-    process.stderr.write(`cv-claude-channels: permission verdict ${verdict} for request ${requestId}\n`)
+    log(`cv-claude-channels: permission verdict ${verdict} for request ${requestId}\n`)
 
     try {
       await mcp.notification({
@@ -691,12 +770,11 @@ async function processMessage(event: CVMessageEvent): Promise<boolean | null> {
         },
       })
     } catch (err) {
-      process.stderr.write(`cv-claude-channels: permission notification failed for ${event.message_id}, will retry: ${err}\n`)
+      log(`cv-claude-channels: permission notification failed for ${event.message_id}, will retry: ${err}\n`)
       return null
     }
 
-    markSeen(event.message_id)
-    await addReaction(event.message_id)
+    await markProcessed(event)
     await markRead(channel_id, event.message_id)
     return true // handled as verdict, don't also forward as chat
   }
@@ -719,12 +797,11 @@ async function processMessage(event: CVMessageEvent): Promise<boolean | null> {
     })
     state.lastCVContext = { channelId: channel_id, replyToId: reply_to_id }
   } catch (err) {
-    process.stderr.write(`cv-claude-channels: notification failed for ${event.message_id}, will retry: ${err}\n`)
+    log(`cv-claude-channels: notification failed for ${event.message_id}, will retry: ${err}\n`)
     return null
   }
 
-  markSeen(event.message_id)
-  await addReaction(event.message_id)
+  await markProcessed(event)
   await markRead(channel_id, event.message_id)
   return true
 }
@@ -734,33 +811,46 @@ async function processMessage(event: CVMessageEvent): Promise<boolean | null> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function fetchMissedMessages() {
+  if (state.fetchInFlight) {
+    state.fetchQueued = true
+    return
+  }
+  state.fetchInFlight = true
+  try {
+    await fetchMissedMessagesOnce()
+    while (state.fetchQueued) {
+      state.fetchQueued = false
+      await fetchMissedMessagesOnce()
+    }
+  } finally {
+    state.fetchInFlight = false
+  }
+}
+
+async function fetchMissedMessagesOnce() {
   const requestStartedAt = new Date().toISOString()
 
-  if (!state.lastSeenAt) {
+  if (!state.lastCheckedAt) {
     // First run — skip history, start cursor from now
-    process.stderr.write(`cv-claude-channels: first run, starting from ${requestStartedAt}\n`)
-    advanceCursor(requestStartedAt)
+    log(`cv-claude-channels: first run, starting from ${requestStartedAt}\n`)
+    updateCursor(requestStartedAt)
     return
   }
 
-  const recentBody = {
-    date: state.lastSeenAt,
+  const result = await getRecentMessages({
+    date: state.lastCheckedAt,
     direction: 'newer',
     limit: 100,
-    use_last_updated: false,
+    use_last_updated: true,
     ...(CONVERSATION_ID ? { channel_id: CONVERSATION_ID } : {}),
-  }
-  process.stderr.write(`cv-claude-channels: POST /v3/messages/recent ${JSON.stringify(recentBody)}\n`)
+  })
 
-  const res = await cvFetch('POST', '/v3/messages/recent', recentBody)
-
-  if (!res.ok) {
-    process.stderr.write(`cv-claude-channels: fetchMissedMessages ${res.status}\n`)
+  if (!result.ok) {
+    log(`cv-claude-channels: fetchMissedMessages ${result.status}\n`)
     return  // don't advance cursor — retry same window next poll
   }
 
-  const data = await res.json() as CVMessageEvent[]
-  const allMessages: CVMessageEvent[] = Array.isArray(data) ? data : []
+  const allMessages = result.messages
 
   // Client-side guard: CV's recent endpoint may ignore channel_id filter
   let messages = allMessages
@@ -768,7 +858,7 @@ async function fetchMissedMessages() {
     messages = allMessages.filter(m => m.channel_ids.includes(CONVERSATION_ID))
     const dropped = allMessages.length - messages.length
     if (allMessages.length > 0) {
-      process.stderr.write(
+      log(
         `cv-claude-channels: /recents returned ${allMessages.length} msgs, ` +
         `${dropped} filtered (channels: ${[...new Set(allMessages.map(m => m.channel_ids[0]))].join(', ')})\n`,
       )
@@ -787,170 +877,23 @@ async function fetchMissedMessages() {
   }
 
   if (messages.length > 0) {
-    process.stderr.write(
+    log(
       `cv-claude-channels: emitted ${processed} new` +
       (firstRetryIdx !== null ? ', cursor held for retry' : '') +
       '\n',
     )
   }
 
-  // Advance cursor to requestStartedAt only if every message was delivered or
-  // filtered. If any message needs retry, leave the cursor unchanged so the
-  // next poll re-fetches from the same window. Already-delivered messages are
-  // protected from double-delivery by the markSeen dedup cache.
+  // Advance cursor as far as possible:
+  // - No retries: advance to requestStartedAt (current time).
+  // - Some retries: advance to just before the first stuck message so the
+  //   next fetch only re-fetches the stuck message onward — not the whole
+  //   window. Already-delivered messages in that window are deduped by markProcessed.
+  // - First message stuck: leave cursor unchanged so the stuck message is retried.
   if (firstRetryIdx === null) {
-    advanceCursor(requestStartedAt)
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// WEBSOCKET (primary mode)
-// ─────────────────────────────────────────────────────────────────────────────
-
-async function connectWebSocket(): Promise<void> {
-  return new Promise((resolve, reject) => {
-    process.stderr.write(`cv-claude-channels: connecting Socket.IO to ${CV_API_BASE}\n`)
-
-    const socket = io(CV_API_BASE, {
-      auth: { authorization: `Bearer ${PAT}` },
-      transports: ['websocket'],
-      reconnection: false,  // we manage reconnection ourselves
-    })
-
-    state.wsSocket = socket
-
-    socket.on('connected', (user: { user_guid?: string; id?: string }) => {
-      process.stderr.write('cv-claude-channels: Socket.IO connected\n')
-      state.mode = 'websocket'
-      state.wsRetryBackoff = 1_000
-
-      // Capture own user ID from the connected event if not already known
-      const uid = user?.user_guid ?? user?.id
-      if (uid && !state.ownUserId) state.ownUserId = uid
-
-      stopPolling()
-
-      // Subscribe to the specific conversation if configured
-      if (CONVERSATION_ID) {
-        socket.emit('subscribe:channel', CONVERSATION_ID, (ack: string) => {
-          process.stderr.write(`cv-claude-channels: subscribed to channel: ${ack}\n`)
-        })
-      }
-
-      resolve()
-    })
-
-    // message:created fires immediately (transcript not yet ready)
-    // message:updated fires when transcription completes — trigger a fetch for both
-    const onMessageEvent = async (payload: {
-      _id?: string
-      status?: string
-      channel_id?: string
-      channel_ids?: string[]
-    }) => {
-      const payloadChannel = payload?.channel_id ?? payload?.channel_ids?.[0] ?? 'unknown'
-      process.stderr.write(`cv-claude-channels: WS event (status=${payload?.status} channel=${payloadChannel}) raw=${JSON.stringify(payload)}\n`)
-      if (payload?.status !== 'active') return
-
-      // Skip fetch if the event is for a different conversation
-      if (CONVERSATION_ID && payloadChannel !== 'unknown' && payloadChannel !== CONVERSATION_ID) {
-        process.stderr.write(`cv-claude-channels: WS event skipped (wrong channel)\n`)
-        return
-      }
-
-      await fetchMissedMessages()
-    }
-
-    socket.on('message:created', onMessageEvent)
-    socket.on('message:updated', onMessageEvent)
-
-    socket.on('connect_error', (err: Error) => {
-      process.stderr.write(`cv-claude-channels: Socket.IO connect error: ${err.message}\n`)
-      state.wsSocket = null
-      reject(err)
-    })
-
-    socket.on('disconnect', async (reason: string) => {
-      if (state.mode === 'shutdown') return
-      process.stderr.write(`cv-claude-channels: Socket.IO disconnected (${reason}) — falling back to polling\n`)
-      state.wsSocket = null
-      state.mode = 'polling'
-      await fetchMissedMessages()
-      startPolling()
-      scheduleWsReconnect()
-    })
-  })
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// WEBSOCKET RECONNECT (runs in background while polling)
-// ─────────────────────────────────────────────────────────────────────────────
-
-function scheduleWsReconnect() {
-  if (state.wsRetryTimer || state.mode === 'shutdown') return
-
-  state.wsRetryTimer = setTimeout(async () => {
-    state.wsRetryTimer = null
-    if (state.mode === 'shutdown') return
-
-    process.stderr.write(
-      `cv-claude-channels: attempting WS reconnect (backoff ${state.wsRetryBackoff}ms)\n`,
-    )
-
-    try {
-      // Catch up before switching back to WS
-      await fetchMissedMessages()
-      await connectWebSocket()
-      // connectWebSocket resolves on 'open', which already calls stopPolling()
-    } catch {
-      // Backoff and try again
-      state.wsRetryBackoff = Math.min(state.wsRetryBackoff * 2, WS_RETRY_MAX_MS)
-      scheduleWsReconnect()
-    }
-  }, state.wsRetryBackoff)
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// POLLING (fallback mode)
-// ─────────────────────────────────────────────────────────────────────────────
-
-function startPolling() {
-  if (state.pollTimer) return
-  process.stderr.write(`cv-claude-channels: polling every ${POLL_INTERVAL_MS}ms\n`)
-
-  const tick = async () => {
-    if (state.mode === 'shutdown' || state.mode === 'websocket') return
-    await fetchMissedMessages()
-    state.pollTimer = setTimeout(tick, POLL_INTERVAL_MS)
-  }
-
-  state.pollTimer = setTimeout(tick, POLL_INTERVAL_MS)
-}
-
-function stopPolling() {
-  if (state.pollTimer) {
-    clearTimeout(state.pollTimer)
-    state.pollTimer = null
-    process.stderr.write('cv-claude-channels: polling stopped (WS reconnected)\n')
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// CONNECT WITH RESILIENCE (initial startup)
-// ─────────────────────────────────────────────────────────────────────────────
-
-async function connectWithResilience() {
-  // Always catch up on any missed messages before first connect
-  await fetchMissedMessages()
-
-  try {
-    await connectWebSocket()
-    // connectWebSocket resolves on 'open'; polling is stopped inside the open handler
-  } catch (err) {
-    process.stderr.write(`cv-claude-channels: WS initial connect failed (${err}) — falling back to polling\n`)
-    state.mode = 'polling'
-    startPolling()
-    scheduleWsReconnect()
+    updateCursor(requestStartedAt)
+  } else if (firstRetryIdx > 0) {
+    updateCursor(messages[firstRetryIdx - 1].created_at)
   }
 }
 
@@ -959,16 +902,13 @@ async function connectWithResilience() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function shutdown(signal: string) {
-  process.stderr.write(`cv-claude-channels: ${signal} received, shutting down\n`)
-  state.mode = 'shutdown'
+  log(`cv-claude-channels: ${signal} received, shutting down\n`)
+  connection?.disconnect()
 
-  if (state.wsSocket)    state.wsSocket.disconnect()
-  if (state.wsRetryTimer) clearTimeout(state.wsRetryTimer)
-  if (state.pollTimer)   clearTimeout(state.pollTimer)
   if (state.flushTimer)  clearTimeout(state.flushTimer)
 
   // Flush cursor immediately
-  state.lastSeenAtDirty = true
+  state.lastCheckedAtDirty = true
   await flushState()
 
   process.exit(0)
@@ -982,4 +922,28 @@ process.on('SIGINT',  () => shutdown('SIGINT'))
 // ─────────────────────────────────────────────────────────────────────────────
 
 await mcp.connect(new StdioServerTransport())
-await startup()
+
+// Wait for the MCP initialize handshake to complete before sending notifications.
+// _clientCapabilities is set during initialize; polling until it's defined (even {})
+// ensures Claude Code is ready to receive channel notifications.
+await new Promise<void>(resolve => {
+  const check = () => {
+    if (mcp.getClientCapabilities() !== undefined) { resolve(); return }
+    setTimeout(check, 50)
+  }
+  setTimeout(check, 50)
+})
+log(`cv-claude-channels: MCP handshake complete, client=${JSON.stringify(mcp.getClientVersion())}\n`)
+
+try {
+  await mcp.notification({
+    method: 'notifications/claude/channel',
+    params: {
+      content: `STARTUP CHECK: Call the confirm_channels tool to activate Carbon Voice channels.`,
+      meta: { source: 'carbon-voice', event: 'startup_check' },
+    },
+  })
+  log(`cv-claude-channels: startup check sent — waiting for confirm_channels tool call\n`)
+} catch (err) {
+  log(`cv-claude-channels: startup notification failed — passive mode: ${err}\n`)
+}
