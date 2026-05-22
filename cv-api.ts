@@ -1,5 +1,6 @@
 import * as fs from 'node:fs/promises'
 import * as path from 'node:path'
+import * as crypto from 'node:crypto'
 import { io, Socket } from 'socket.io-client'
 
 const CV_API_BASE = 'https://api.carbonvoice.app'
@@ -43,26 +44,30 @@ export interface Reaction {
   image_url: string
 }
 
-export interface AttachmentPayload {
+export interface LinkAttachment {
   type: 'link'
   link: string
-  idempotency_key?: string
+}
+
+export interface FileAttachment {
+  type: 'file'
+  path: string
+  filename: string
+  mime_type: string
+}
+
+export type MessageAttachment = LinkAttachment | FileAttachment
+
+interface AttachmentPayload {
+  type: 'link' | 'file'
+  link: string
   filename?: string
   mime_type?: string
-  length_in_bytes?: number
   status?: string
   percent_complete?: number
 }
 
-export interface SendMessageBody {
-  idempotency_key: string
-  conversation_id: string
-  thread_id: string
-  transcript: string
-  attachments?: AttachmentPayload[]
-}
-
-export interface AttachmentRecord {
+interface AttachmentRecord {
   _id?: string
   id?: string
 }
@@ -134,15 +139,81 @@ export async function markRead(channelId: string, messageId: string): Promise<vo
 // MESSAGES
 // ─────────────────────────────────────────────────────────────────────────────
 
-export async function sendMessage(
-  body: SendMessageBody,
-): Promise<{ message_id?: string; id?: string; attachments?: AttachmentRecord[] }> {
-  const res = await cvFetch('POST', '/v5/messages/text', body)
+export async function sendMessage(params: {
+  conversationId: string
+  threadId: string
+  transcript: string
+  attachments?: MessageAttachment[]
+}): Promise<string> {
+  const attachments = params.attachments ?? []
+  const fileAttachments = attachments.filter((a): a is FileAttachment => a.type === 'file')
+  const linkAttachments = attachments.filter((a): a is LinkAttachment => a.type === 'link')
+
+  const resolvedFiles = await Promise.all(fileAttachments.map(async a => {
+    const abs = path.isAbsolute(a.path) ? a.path : path.resolve(process.cwd(), a.path)
+    return { ...a, path: await resolveActualPath(abs) }
+  }))
+
+  const signedUrls = resolvedFiles.length > 0
+    ? await Promise.all(resolvedFiles.map(a => getSignedUrl(a.filename, a.mime_type)))
+    : []
+  const baseUrls = signedUrls.map(u => u.split('?')[0])
+  const s3Uploads = resolvedFiles.map((a, i) => uploadToS3(signedUrls[i], a.path, a.mime_type))
+  s3Uploads.forEach(p => p.catch(() => {}))
+
+  const linkPayloads: AttachmentPayload[] = linkAttachments.map(a => ({ type: 'link', link: a.link }))
+  const filePayloads: AttachmentPayload[] = resolvedFiles.map((a, i) => ({
+    type: 'file',
+    link: baseUrls[i],
+    filename: a.filename,
+    mime_type: a.mime_type,
+    status: 'Initializing',
+    percent_complete: 0,
+  }))
+  const allPayloads = [...linkPayloads, ...filePayloads]
+
+  const res = await cvFetch('POST', '/v5/messages/text', {
+    idempotency_key: crypto.randomUUID(),
+    conversation_id: params.conversationId,
+    thread_id: params.threadId,
+    transcript: params.transcript,
+    attachments: allPayloads.length > 0 ? allPayloads : undefined,
+  })
   if (!res.ok) {
     const text = await res.text()
     throw new Error(`CV sendMessage failed ${res.status}: ${text}`)
   }
-  return res.json() as Promise<{ message_id?: string; id?: string; attachments?: AttachmentRecord[] }>
+  const data = await res.json() as { message_id?: string; id?: string; attachments?: AttachmentRecord[] }
+  const messageId = data.message_id ?? data.id ?? '?'
+
+  if (resolvedFiles.length > 0) {
+    const sentAttachments = data.attachments ?? []
+    Promise.all(s3Uploads.map(async (upload, i) => {
+      const record = sentAttachments[linkPayloads.length + i]
+      const attachmentId = record?._id ?? record?.id
+      if (!attachmentId) {
+        _log(`cv-claude-channels: no attachment ID for file[${i}] — skipping status updates\n`)
+        return
+      }
+      const base = {
+        type: 'file' as const,
+        link: baseUrls[i],
+        filename: resolvedFiles[i].filename,
+        mime_type: resolvedFiles[i].mime_type,
+      }
+      await updateAttachment(messageId, attachmentId, { ...base, status: 'Uploading', percent_complete: 0 })
+      try {
+        await upload
+        _log(`cv-claude-channels: S3 upload complete for file[${i}] ${resolvedFiles[i].filename}\n`)
+        await updateAttachment(messageId, attachmentId, { ...base, status: 'Uploaded', percent_complete: 100 })
+      } catch (err) {
+        _log(`cv-claude-channels: S3 upload failed for file[${i}] ${resolvedFiles[i].filename}: ${err}\n`)
+        await updateAttachment(messageId, attachmentId, { ...base, status: 'Failed', percent_complete: 0 })
+      }
+    })).catch(err => _log(`cv-claude-channels: background upload error: ${err}\n`))
+  }
+
+  return messageId
 }
 
 export async function getRecentMessages(params: {

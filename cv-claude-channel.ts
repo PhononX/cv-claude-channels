@@ -37,16 +37,14 @@ import { z } from 'zod'
 import * as fs from 'node:fs/promises'
 import * as path from 'node:path'
 import * as os from 'node:os'
-import * as crypto from 'node:crypto'
 import {
   init as initApi,
   whoami, getReactions, addReaction, markRead,
   sendMessage, getRecentMessages,
-  getSignedUrl, uploadToS3, updateAttachment, resolveActualPath,
-  type AttachmentPayload,
   createConnection,
   type CVConnection,
   type CVMessageEvent,
+  type MessageAttachment,
 } from './cv-api.js'
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -322,73 +320,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         attachments?: Attachment[]
       }
 
-    const allAttachments = attachments ?? []
-    const fileInputs = allAttachments.filter((a): a is FileAttachment => a.type === 'file')
-
-    // Resolve relative paths against cwd, then fix unicode space variants in filenames
-    const resolvedFileInputs = await Promise.all(fileInputs.map(async a => {
-      const abs = path.isAbsolute(a.path) ? a.path : path.resolve(process.cwd(), a.path)
-      return { ...a, path: await resolveActualPath(abs) }
-    }))
-
-    const linkPayloads: AttachmentPayload[] = allAttachments
-      .filter((a): a is LinkAttachment => a.type === 'link')
-      .map(a => ({ type: 'link', link: a.link }))
-
-    // Step 1: get signed URLs and kick off S3 uploads before creating the message
-    const signedUrls = resolvedFileInputs.length > 0
-      ? await Promise.all(resolvedFileInputs.map(a => getSignedUrl(a.filename, a.mime_type)))
-      : []
-    // Strip query params — CV stores the base URL, not the signed one
-    const baseUrls = signedUrls.map(u => u.split('?')[0])
-    const s3Uploads = resolvedFileInputs.map((a, i) => uploadToS3(signedUrls[i], a.path, a.mime_type))
-    // Suppress unhandled-rejection warnings in case the handler throws before step 2 can await these.
-    s3Uploads.forEach(p => p.catch(() => {}))
-
-    const filePayloads: AttachmentPayload[] = resolvedFileInputs.map((a, i) => ({
-      type: 'link',
-      link: baseUrls[i],
-      filename: a.filename,
-      mime_type: a.mime_type,
-      status: 'Initializing',
-      percent_complete: 0,
-    }))
-
-    // Step 2: create the message with attachments included in the POST
-    const data = await sendMessage({
-      idempotency_key: crypto.randomUUID(),
-      conversation_id: channel_id,
-      thread_id: reply_to_message_id,
+    const sent_id = await sendMessage({
+      conversationId: channel_id,
+      threadId: reply_to_message_id,
       transcript: text,
-      attachments: [...linkPayloads, ...filePayloads].length > 0
-        ? [...linkPayloads, ...filePayloads]
-        : undefined,
+      attachments: attachments as MessageAttachment[] | undefined,
     })
-    const sent_id = data.message_id ?? data.id ?? '?'
-
-    if (resolvedFileInputs.length > 0) {
-      const sentAttachments = data.attachments ?? []
-
-      // Step 3: finish uploads and mark Uploaded in the background — don't block the tool response
-      Promise.all(s3Uploads.map(async (upload, i) => {
-        await upload
-        log(`cv-claude-channels: S3 upload complete for file[${i}] ${resolvedFileInputs[i].filename}\n`)
-        const record = sentAttachments[linkPayloads.length + i]
-        const attachmentId = record?._id ?? record?.id
-        if (!attachmentId) {
-          log(`cv-claude-channels: no attachment ID for file[${i}] — skipping PUT\n`)
-          return
-        }
-        await updateAttachment(sent_id, attachmentId, {
-          type: 'link',
-          link: baseUrls[i],
-          filename: resolvedFileInputs[i].filename,
-          mime_type: resolvedFileInputs[i].mime_type,
-          status: 'Uploaded',
-          percent_complete: 100,
-        })
-      })).catch(err => log(`cv-claude-channels: background upload error: ${err}\n`))
-    }
 
     return {
       content: [{ type: 'text', text: `sent: ${sent_id}` }],
@@ -410,9 +347,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     state.pendingAllowContext.delete(user_id)
     if (ctx) {
       sendMessage({
-        idempotency_key: crypto.randomUUID(),
-        conversation_id: ctx.channelId,
-        thread_id: ctx.messageId,
+        conversationId: ctx.channelId,
+        threadId: ctx.messageId,
         transcript: `You are now allowed to message Claude project \`${PROJECT_NAME}\` through this channel.`,
       }).catch(() => {})
     }
@@ -510,9 +446,8 @@ mcp.setNotificationHandler(PermissionRequestSchema, async ({ params }) => {
 
   try {
     await sendMessage({
-      idempotency_key: crypto.randomUUID(),
-      conversation_id: ctx.channelId,
-      thread_id: ctx.replyToId,
+      conversationId: ctx.channelId,
+      threadId: ctx.replyToId,
       transcript: text,
     })
     log(`cv-claude-channels: permission request for ${params.tool_name} relayed to CV (request_id=${params.request_id})\n`)
@@ -718,9 +653,8 @@ async function processMessage(event: CVMessageEvent): Promise<boolean | null> {
 
       if (state.access.allowFrom.length === 0) {
         sendMessage({
-          idempotency_key: crypto.randomUUID(),
-          conversation_id: event.channel_ids[0],
-          thread_id: event.message_id,
+          conversationId: event.channel_ids[0],
+          threadId: event.message_id,
           transcript: 'Allow Sender list is currently empty. Go to Claude to approve senders.',
         }).catch(() => {})
       }
