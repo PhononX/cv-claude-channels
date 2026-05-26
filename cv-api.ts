@@ -46,7 +46,7 @@ export interface Reaction {
 
 export interface LinkAttachment {
   type: 'link'
-  link: string
+  url: string
 }
 
 export interface FileAttachment {
@@ -139,6 +139,27 @@ export async function markRead(channelId: string, messageId: string): Promise<vo
 // MESSAGES
 // ─────────────────────────────────────────────────────────────────────────────
 
+const MIME_BY_EXT: Record<string, string> = {
+  '.md': 'text/markdown', '.markdown': 'text/markdown',
+  '.txt': 'text/plain', '.csv': 'text/csv',
+  '.json': 'application/json', '.xml': 'application/xml',
+  '.pdf': 'application/pdf',
+  '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif', '.webp': 'image/webp',
+  '.mp4': 'video/mp4', '.mov': 'video/quicktime',
+  '.zip': 'application/zip',
+}
+
+export function attachmentFromString(value: string): MessageAttachment {
+  if (/^https?:\/\//i.test(value)) {
+    return { type: 'link', url: value }
+  }
+  const abs = path.isAbsolute(value) ? value : path.resolve(process.cwd(), value)
+  const filename = path.basename(abs)
+  const mime_type = MIME_BY_EXT[path.extname(filename).toLowerCase()] ?? 'application/octet-stream'
+  return { type: 'file', path: abs, filename, mime_type }
+}
+
 export async function sendMessage(params: {
   conversationId: string
   threadId: string
@@ -161,7 +182,7 @@ export async function sendMessage(params: {
   const s3Uploads = resolvedFiles.map((a, i) => uploadToS3(signedUrls[i], a.path, a.mime_type))
   s3Uploads.forEach(p => p.catch(() => {}))
 
-  const linkPayloads: AttachmentPayload[] = linkAttachments.map(a => ({ type: 'link', link: a.link }))
+  const linkPayloads: AttachmentPayload[] = linkAttachments.map(a => ({ type: 'link', link: a.url }))
   const filePayloads: AttachmentPayload[] = resolvedFiles.map((a, i) => ({
     type: 'file',
     link: baseUrls[i],
@@ -235,12 +256,13 @@ export async function getRecentMessages(params: {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function getSignedUrl(filename: string, mime_type: string): Promise<string> {
-  const res = await cvFetch('POST', '/v3/attachments/signedurl', {
-    files: [{ filename, mimetype: mime_type }],
+  const res = await cvFetch('POST', '/v5/attachments/signedurl', {
+    filename,
+    mimetype: mime_type,
   })
   if (!res.ok) throw new Error(`CV signedurl failed ${res.status}: ${await res.text()}`)
-  const data = await res.json() as Array<{ url: string }>
-  return data[0].url
+  const data = await res.json() as { url: string }
+  return data.url
 }
 
 export async function uploadToS3(url: string, filePath: string, mime_type: string): Promise<void> {

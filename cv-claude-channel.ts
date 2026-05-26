@@ -40,11 +40,10 @@ import * as os from 'node:os'
 import {
   init as initApi,
   whoami, getReactions, addReaction, markRead,
-  sendMessage, getRecentMessages,
+  sendMessage, getRecentMessages, attachmentFromString,
   createConnection,
   type CVConnection,
   type CVMessageEvent,
-  type MessageAttachment,
 } from './cv-api.js'
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -201,30 +200,11 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
           attachments: {
             type: 'array',
-            description: 'Optional list of attachments to include with the message.',
+            description:
+              'Optional list of attachments. Each item is either a URL (https://...) ' +
+              'or an absolute local file path. URLs are attached as links; local files are uploaded automatically.',
             items: {
-              oneOf: [
-                {
-                  type: 'object',
-                  description: 'A link attachment.',
-                  properties: {
-                    type: { type: 'string', enum: ['link'] },
-                    link: { type: 'string', description: 'The URL to attach.' },
-                  },
-                  required: ['type', 'link'],
-                },
-                {
-                  type: 'object',
-                  description: 'A file attachment. The server uploads the file and resolves the URL.',
-                  properties: {
-                    type: { type: 'string', enum: ['file'] },
-                    path: { type: 'string', description: 'Absolute path to the local file to attach.' },
-                    filename: { type: 'string', description: 'The display filename (e.g. "document.pdf").' },
-                    mime_type: { type: 'string', description: 'The MIME type (e.g. "application/pdf").' },
-                  },
-                  required: ['type', 'path', 'filename', 'mime_type'],
-                },
-              ],
+              type: 'string',
             },
           },
         },
@@ -308,23 +288,19 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
 
 mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   if (req.params.name === 'send_message') {
-    type LinkAttachment = { type: 'link'; link: string }
-    type FileAttachment = { type: 'file'; path: string; filename: string; mime_type: string }
-    type Attachment = LinkAttachment | FileAttachment
-
     const { channel_id, reply_to_message_id, text, attachments } =
       req.params.arguments as {
         channel_id: string
         reply_to_message_id: string
         text: string
-        attachments?: Attachment[]
+        attachments?: string[]
       }
 
     const sent_id = await sendMessage({
       conversationId: channel_id,
       threadId: reply_to_message_id,
       transcript: text,
-      attachments: attachments as MessageAttachment[] | undefined,
+      attachments: attachments?.map(attachmentFromString),
     })
 
     return {
