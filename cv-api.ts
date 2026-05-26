@@ -176,7 +176,7 @@ export async function sendMessage(params: {
   }))
 
   const signedUrls = resolvedFiles.length > 0
-    ? await Promise.all(resolvedFiles.map(a => getSignedUrl(a.filename, a.mime_type)))
+    ? await Promise.all(resolvedFiles.map(a => getSignedUrl(`${crypto.randomUUID()}-${a.filename}`, a.mime_type)))
     : []
   const baseUrls = signedUrls.map(u => u.split('?')[0])
   const s3Uploads = resolvedFiles.map((a, i) => uploadToS3(signedUrls[i], a.path, a.mime_type))
@@ -256,13 +256,12 @@ export async function getRecentMessages(params: {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function getSignedUrl(filename: string, mime_type: string): Promise<string> {
-  const res = await cvFetch('POST', '/v5/attachments/signedurl', {
-    filename,
-    mimetype: mime_type,
+  const res = await cvFetch('POST', '/v3/attachments/signedurl', {
+    files: [{ filename, mimetype: mime_type }],
   })
   if (!res.ok) throw new Error(`CV signedurl failed ${res.status}: ${await res.text()}`)
-  const data = await res.json() as { url: string }
-  return data.url
+  const data = await res.json() as Array<{ url: string }>
+  return data[0].url
 }
 
 export async function uploadToS3(url: string, filePath: string, mime_type: string): Promise<void> {
