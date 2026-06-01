@@ -196,7 +196,7 @@ export async function sendMessage(params: {
   const res = await cvFetch('POST', '/v5/messages/text', {
     idempotency_key: crypto.randomUUID(),
     conversation_id: params.conversationId,
-    thread_id: params.threadId,
+    reply_to_message_id: params.threadId,
     transcript: params.transcript,
     attachments: allPayloads.length > 0 ? allPayloads : undefined,
   })
