@@ -24,11 +24,27 @@ export interface CVReactionSummary {
   top_user_reactions: Array<{ user_id: string; reaction_id: string }>
 }
 
+export interface CVAttachment {
+  _id: string
+  client_id?: string
+  creator_id?: string
+  created_at?: string
+  type: 'link' | 'file'
+  link: string
+  filename?: string
+  mime_type?: string
+  length_in_bytes?: number
+  status?: 'Initializing' | 'Uploading' | 'Uploaded' | 'Failed' | string
+  percent_complete?: number
+}
+
 export interface CVMessageEvent {
   message_id: string
   channel_ids: string[]
   creator_id: string
+  last_updated_at?: string
   text_models: Array<{ type: string; value: string; timecodes?: CVTimecode[] }>
+  attachments?: CVAttachment[]
   parent_message_id: string | null
   created_at: string
   is_text_message: boolean
@@ -176,7 +192,7 @@ export async function sendMessage(params: {
   }))
 
   const signedUrls = resolvedFiles.length > 0
-    ? await Promise.all(resolvedFiles.map(a => getSignedUrl(`${crypto.randomUUID()}-${a.filename}`, a.mime_type)))
+    ? await Promise.all(resolvedFiles.map(a => getUploadSignedUrl(a.filename, a.mime_type, crypto.randomUUID())))
     : []
   const baseUrls = signedUrls.map(u => u.split('?')[0])
   const s3Uploads = resolvedFiles.map((a, i) => uploadToS3(signedUrls[i], a.path, a.mime_type))
@@ -255,13 +271,64 @@ export async function getRecentMessages(params: {
 // ATTACHMENTS
 // ─────────────────────────────────────────────────────────────────────────────
 
-export async function getSignedUrl(filename: string, mime_type: string): Promise<string> {
-  const res = await cvFetch('POST', '/v3/attachments/signedurl', {
-    files: [{ filename, mimetype: mime_type }],
+export async function getUploadSignedUrl(filename: string, mime_type: string, idempotency_key: string): Promise<string> {
+  const res = await cvFetch('POST', '/v5/attachments/upload/signedurl', {
+    files: [{ filename, mimetype: mime_type, idempotency_key }],
   })
-  if (!res.ok) throw new Error(`CV signedurl failed ${res.status}: ${await res.text()}`)
+  if (!res.ok) throw new Error(`CV upload signedurl failed ${res.status}: ${await res.text()}`)
   const data = await res.json() as Array<{ url: string }>
   return data[0].url
+}
+
+export async function getDownloadSignedUrl(attachmentId: string): Promise<string> {
+  const res = await cvFetch('GET', `/v5/attachments/download/signedurl/${attachmentId}`)
+  if (!res.ok) throw new Error(`CV attachment download signedurl failed ${res.status}`)
+  return res.text()
+}
+
+export async function getDownloadSignedUrls(
+  ids: string[],
+): Promise<Array<{ attachment_id: string; signed_url: string }>> {
+  const res = await cvFetch('POST', '/v5/attachments/download/signedurl/bulk', { ids })
+  if (!res.ok) throw new Error(`CV attachment download bulk signedurl failed ${res.status}`)
+  return res.json() as Promise<Array<{ attachment_id: string; signed_url: string }>>
+}
+
+export async function resolveAttachmentUrls(
+  attachments: CVAttachment[],
+): Promise<Map<string, string>> {
+  const uploadedIds = attachments
+    .filter(a => a.type === 'file' && a.status === 'Uploaded')
+    .map(a => a._id)
+  if (uploadedIds.length === 0) return new Map()
+  const results = await getDownloadSignedUrls(uploadedIds)
+  return new Map(results.map(r => [r.attachment_id, r.signed_url]))
+}
+
+export async function downloadAttachmentsToDir(
+  attachments: CVAttachment[],
+  destDir: string,
+): Promise<Map<string, string>> {
+  const uploaded = attachments.filter(a => a.type === 'file' && a.status === 'Uploaded')
+  if (uploaded.length === 0) return new Map()
+
+  const results = await getDownloadSignedUrls(uploaded.map(a => a._id))
+  await fs.mkdir(destDir, { recursive: true })
+
+  const localPaths = new Map<string, string>()
+  await Promise.all(
+    results.map(async ({ attachment_id, signed_url }) => {
+      const attachment = uploaded.find(a => a._id === attachment_id)
+      const filename = attachment?.filename ?? attachment_id
+      const destPath = path.join(destDir, filename)
+      const res = await fetch(signed_url)
+      if (!res.ok) throw new Error(`attachment download failed ${res.status}: ${attachment_id}`)
+      await fs.writeFile(destPath, Buffer.from(await res.arrayBuffer()))
+      localPaths.set(attachment_id, destPath)
+    }),
+  )
+
+  return localPaths
 }
 
 export async function uploadToS3(url: string, filePath: string, mime_type: string): Promise<void> {

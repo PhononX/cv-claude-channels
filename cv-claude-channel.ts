@@ -15,7 +15,8 @@
  *       "args": ["tsx", "./cv-claude-channel.ts"],
  *       "env": {
  *         "CV_PAT": "your-personal-access-token",
- *         "CV_CONVERSATION_ID": ""  // optional: scope to one conversation guid; omit to receive all
+ *         "CV_CONVERSATION_ID": "",      // optional: scope to one conversation guid; omit to receive all
+ *         "CV_ATTACHMENTS_DIR": ""       // optional: folder for downloaded attachments; defaults to ~/.claude/channels/cv/attachments
  *       }
  *     }
  *   }
@@ -41,9 +42,11 @@ import {
   init as initApi,
   whoami, getReactions, addReaction, markRead,
   sendMessage, getRecentMessages, attachmentFromString,
+  downloadAttachmentsToDir,
   createConnection,
   type CVConnection,
   type CVMessageEvent,
+  type CVAttachment,
 } from './cv-api.js'
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -53,12 +56,16 @@ import {
 const PAT                  = process.env.CV_PAT ?? ''
 const CONVERSATION_ID      = process.env.CV_CONVERSATION_ID ?? ''   // optional: scope to one conversation
 const REACTION_ID          = process.env.CV_REACTION_ID ?? ''       // optional: pin a specific reaction ID
-const POLL_INTERVAL_MS     = Number(process.env.CV_POLL_INTERVAL_MS  ?? 5_000)
-const WS_RETRY_MAX_MS      = Number(process.env.CV_WS_RETRY_MAX_MS   ?? 30_000)
+const POLL_INTERVAL_MS          = Number(process.env.CV_POLL_INTERVAL_MS           ?? 5_000)
+const WS_RETRY_MAX_MS           = Number(process.env.CV_WS_RETRY_MAX_MS            ?? 30_000)
+const ATTACHMENT_TIMEOUT_MS     = Number(process.env.CV_ATTACHMENT_TIMEOUT_MS      ?? 600_000)
+const ATTACHMENT_NUDGE_MS       = Number(process.env.CV_ATTACHMENT_NUDGE_MS        ?? 120_000)
 const STATE_PATH           = process.env.CV_STATE_PATH
   ?? path.join(os.homedir(), '.claude', 'channels', 'cv', `state${CONVERSATION_ID ? `-${CONVERSATION_ID}` : ''}.json`)
 const ACCESS_PATH          = process.env.CV_ACCESS_PATH
   ?? path.join(os.homedir(), '.claude', 'channels', 'cv', 'access.json')
+const ATTACHMENTS_DIR      = process.env.CV_ATTACHMENTS_DIR
+  ?? path.join(os.homedir(), '.claude', 'channels', 'cv', 'attachments')
 const PROJECT_NAME         = process.env.CV_PROJECT_NAME ?? 'this project'
 const LOG_FILE             = process.env.CV_LOG_FILE ?? ''
 
@@ -97,6 +104,8 @@ interface State {
   access: Access                        // file-backed allowlist
   unknownSenderSeen: Set<string>        // senders already notified this session (avoid spam)
   pendingAllowContext: Map<string, { channelId: string; messageId: string }>  // context for allow confirmation
+  pendingAttachments: Map<string, { channelId: string; replyToId: string; senderId: string; deadline: number; nudgeAt: number; nudgeSent: boolean; filenames: string[] }>
+  attachmentFollowUpSent: Set<string>  // message IDs for which attachment follow-up has been sent
   cvStarted: boolean                    // true once startup() has been called
 }
 
@@ -117,6 +126,8 @@ const state: State = {
   access: { allowFrom: [], blockedFrom: [] },
   unknownSenderSeen: new Set(),
   pendingAllowContext: new Map(),
+  pendingAttachments: new Map(),
+  attachmentFollowUpSent: new Set(),
   cvStarted: false,
 }
 
@@ -148,7 +159,14 @@ Each message arrives as a <channel> tag with these attributes:
   reply_to_id      — the message ID to thread your reply under
                      (use this, not message_id, when calling send_message)
 
-The tag body is the transcript of what was said.
+The tag body is the transcript of what was said. If the message includes
+attachments, they appear after the transcript in the body, formatted as:
+
+  Attachments:
+  - filename (mime_type): /absolute/local/path
+
+Attachment files have been downloaded to a local directory. Use the Read tool
+to access them (e.g. to view an image, parse a document, or read a file).
 
 To reply, call the send_message tool with:
   channel_id       — from the <channel> tag
@@ -655,8 +673,52 @@ async function processMessage(event: CVMessageEvent): Promise<boolean | null> {
   // Terminal statuses will never produce a transcript — skip them
   if (!transcript && (event.status === 'canceled' || event.status === 'deleted')) return false
 
+  const hasAttachments = (event.attachments?.length ?? 0) > 0
+
   // Not ready yet — let the next poll retry without marking seen
-  if (!transcript) return null
+  // Exception: attachment-only messages have no transcript and never will
+  if (!transcript && !hasAttachments) return null
+
+  const attachments: CVAttachment[] = event.attachments ?? []
+
+  if (attachments.length > 0) {
+    log(`cv-claude-channels: message ${event.message_id} has ${attachments.length} attachment(s): ${JSON.stringify(attachments.map(a => ({ _id: a._id, type: a.type, filename: a.filename, mime_type: a.mime_type, status: a.status })))}\n`)
+  }
+
+  // Download uploaded file attachments to a local directory for Claude to read directly.
+  const localPaths = await downloadAttachmentsToDir(
+    attachments,
+    path.join(ATTACHMENTS_DIR, event.message_id),
+  ).catch((err: unknown) => {
+    log(`cv-claude-channels: failed to download attachments for ${event.message_id}: ${err}\n`)
+    return new Map<string, string>()
+  })
+
+  const hasPendingUploads = attachments.some(
+    a => a.type === 'file' && (a.status === 'Initializing' || a.status === 'Uploading'),
+  )
+
+  const attachmentLines = attachments
+    .map(a => {
+      if (a.type === 'file' && (a.status === 'Initializing' || a.status === 'Uploading')) {
+        const label = a.filename ?? a.mime_type ?? 'file'
+        return `- ${label}: (uploading — follow-up will arrive when ready)`
+      }
+      if (a.type === 'file' && a.status === 'Failed') {
+        const label = a.filename ?? a.mime_type ?? 'file'
+        return `- ${label}: (upload failed)`
+      }
+      const ref = a.type === 'file' ? localPaths.get(a._id) : a.link
+      if (!ref) return null
+      const label = a.filename ? `${a.filename} (${a.mime_type ?? a.type})` : (a.mime_type ?? a.type)
+      return `- ${label}: ${ref}`
+    })
+    .filter((line): line is string => line !== null)
+
+  const body = transcript || '(no transcript)'
+  const content = attachmentLines.length > 0
+    ? `${body}\n\nAttachments:\n${attachmentLines.join('\n')}`
+    : body
 
   const reply_to_id = event.parent_message_id ?? event.message_id
 
@@ -690,7 +752,7 @@ async function processMessage(event: CVMessageEvent): Promise<boolean | null> {
     await mcp.notification({
       method: 'notifications/claude/channel',
       params: {
-        content: transcript,
+        content,
         meta: {
           source:        'carbon-voice',
           channel_id,
@@ -702,6 +764,28 @@ async function processMessage(event: CVMessageEvent): Promise<boolean | null> {
       },
     })
     state.lastCVContext = { channelId: channel_id, replyToId: reply_to_id }
+    // Mark messages whose attachments were fully delivered inline so the follow-up
+    // scanner doesn't re-send them.
+    if (localPaths.size > 0 && !hasPendingUploads) {
+      state.attachmentFollowUpSent.add(event.message_id)
+    }
+
+    if (hasPendingUploads) {
+      const now = Date.now()
+      const filenames = attachments
+        .filter(a => a.type === 'file' && (a.status === 'Initializing' || a.status === 'Uploading'))
+        .map(a => a.filename ?? a.mime_type ?? 'file')
+      state.pendingAttachments.set(event.message_id, {
+        channelId: channel_id,
+        replyToId: reply_to_id,
+        senderId: event.creator_id,
+        deadline: now + ATTACHMENT_TIMEOUT_MS,
+        nudgeAt: now + ATTACHMENT_NUDGE_MS,
+        nudgeSent: false,
+        filenames,
+      })
+      log(`cv-claude-channels: registered ${event.message_id} for attachment follow-up (deadline ${ATTACHMENT_TIMEOUT_MS}ms)\n`)
+    }
   } catch (err) {
     log(`cv-claude-channels: notification failed for ${event.message_id}, will retry: ${err}\n`)
     return null
@@ -710,6 +794,148 @@ async function processMessage(event: CVMessageEvent): Promise<boolean | null> {
   await markProcessed(event)
   await markRead(channel_id, event.message_id)
   return true
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ATTACHMENT FOLLOW-UP
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function checkPendingAttachments(polledMessages: CVMessageEvent[]): Promise<void> {
+  if (state.pendingAttachments.size === 0) return
+
+  const now = Date.now()
+
+  // Build a lookup of updated messages from this poll batch
+  const updatedById = new Map(polledMessages.map(m => [m.message_id, m]))
+
+  for (const [messageId, pending] of state.pendingAttachments) {
+    const updated = updatedById.get(messageId)
+    const timedOut = now >= pending.deadline
+
+    const attachments = updated?.attachments ?? []
+    const fileAttachments = attachments.filter(a => a.type === 'file')
+    const stillPending = updated
+      ? fileAttachments.some(a => a.status === 'Initializing' || a.status === 'Uploading')
+      : true  // not in this batch yet, assume still pending
+
+    // Send nudge if we've been waiting more than nudge threshold and haven't nudged yet
+    if (!pending.nudgeSent && now >= pending.nudgeAt && stillPending && !timedOut) {
+      const names = pending.filenames.join(', ')
+      log(`cv-claude-channels: sending nudge for pending attachment(s) on ${messageId}\n`)
+      sendMessage({
+        conversationId: pending.channelId,
+        threadId: pending.replyToId,
+        transcript: `Still waiting on ${names} to finish uploading.`,
+      }).catch(err => log(`cv-claude-channels: nudge send failed for ${messageId}: ${err}\n`))
+      pending.nudgeSent = true
+    }
+
+    // Not resolved and not yet expired — keep waiting
+    if (stillPending && !timedOut) continue
+
+    state.pendingAttachments.delete(messageId)
+
+    // Download any uploaded files locally
+    const localPaths = await downloadAttachmentsToDir(
+      fileAttachments,
+      path.join(ATTACHMENTS_DIR, messageId),
+    ).catch((err: unknown) => {
+      log(`cv-claude-channels: follow-up download failed for ${messageId}: ${err}\n`)
+      return new Map<string, string>()
+    })
+
+    const lines = fileAttachments.map(a => {
+      if (a.status === 'Uploaded') {
+        const localPath = localPaths.get(a._id)
+        if (localPath) {
+          const label = a.filename ? `${a.filename} (${a.mime_type ?? a.type})` : (a.mime_type ?? a.type)
+          return `- ${label}: ${localPath}`
+        }
+      }
+      const label = a.filename ?? a.mime_type ?? 'file'
+      return `- ${label}: (upload ${timedOut && a.status !== 'Uploaded' ? 'timed out' : 'failed'})`
+    })
+
+    if (lines.length === 0) continue
+
+    log(`cv-claude-channels: sending attachment follow-up for ${messageId} (timedOut=${timedOut})\n`)
+
+    try {
+      await mcp.notification({
+        method: 'notifications/claude/channel',
+        params: {
+          content: `Attachment follow-up:\n${lines.join('\n')}`,
+          meta: {
+            source:               'carbon-voice',
+            channel_id:           pending.channelId,
+            message_id:           messageId,
+            sender_id:            pending.senderId,
+            is_reply:             'true',
+            reply_to_id:          pending.replyToId,
+            is_attachment_followup: 'true',
+          },
+        },
+      })
+    } catch (err) {
+      log(`cv-claude-channels: attachment follow-up notification failed for ${messageId}: ${err}\n`)
+      // Re-register with original deadline so we retry on the next poll
+      state.pendingAttachments.set(messageId, pending)
+    }
+  }
+
+  // Second pass: catch messages that were processed with no attachments but later had
+  // attachments added (Carbon Voice adds the attachment to the message after the fact).
+  for (const event of polledMessages) {
+    if (!isProcessed(event)) continue
+    if (state.attachmentFollowUpSent.has(event.message_id)) continue
+    if (state.pendingAttachments.has(event.message_id)) continue  // already tracked above
+
+    const uploadedFiles = (event.attachments ?? []).filter(
+      a => a.type === 'file' && a.status === 'Uploaded',
+    )
+    if (uploadedFiles.length === 0) continue
+
+    state.attachmentFollowUpSent.add(event.message_id)
+    log(`cv-claude-channels: post-processed attachment(s) found for ${event.message_id}, sending follow-up\n`)
+
+    const localPaths = await downloadAttachmentsToDir(
+      uploadedFiles,
+      path.join(ATTACHMENTS_DIR, event.message_id),
+    ).catch((err: unknown) => {
+      log(`cv-claude-channels: follow-up download failed for ${event.message_id}: ${err}\n`)
+      return new Map<string, string>()
+    })
+
+    const lines = uploadedFiles.map(a => {
+      const localPath = localPaths.get(a._id)
+      const label = a.filename ? `${a.filename} (${a.mime_type ?? a.type})` : (a.mime_type ?? a.type)
+      return localPath ? `- ${label}: ${localPath}` : `- ${label}: (download unavailable)`
+    })
+
+    const channel_id = event.channel_ids[0] ?? ''
+    const reply_to_id = event.parent_message_id ?? event.message_id
+
+    try {
+      await mcp.notification({
+        method: 'notifications/claude/channel',
+        params: {
+          content: `Attachment follow-up:\n${lines.join('\n')}`,
+          meta: {
+            source:                 'carbon-voice',
+            channel_id,
+            message_id:             event.message_id,
+            sender_id:              event.creator_id,
+            is_reply:               'true',
+            reply_to_id,
+            is_attachment_followup: 'true',
+          },
+        },
+      })
+    } catch (err) {
+      log(`cv-claude-channels: post-processed follow-up failed for ${event.message_id}: ${err}\n`)
+      state.attachmentFollowUpSent.delete(event.message_id)  // retry next poll
+    }
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -789,6 +1015,8 @@ async function fetchMissedMessagesOnce() {
       '\n',
     )
   }
+
+  await checkPendingAttachments(allMessages)
 
   // Advance cursor as far as possible:
   // - No retries: advance to requestStartedAt (current time).
