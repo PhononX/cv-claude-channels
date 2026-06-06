@@ -963,7 +963,7 @@ async function checkPendingAttachments(polledMessages: CVMessageEvent[]): Promis
       const refetch = await getRecentMessages({
         date: justBefore,
         direction: 'newer',
-        limit: 10,
+        limit: 100,
         use_last_updated: true,
         ...(CONVERSATION_ID ? { channel_id: CONVERSATION_ID } : {}),
       })
