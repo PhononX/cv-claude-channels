@@ -1,6 +1,6 @@
 {
   "name": "@carbonvoice/cv-claude-channel",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "description": "Carbon Voice Claude Channel server - bridges Carbon Voice conversations into Claude Code sessions",
   "type": "module",
   "main": "./dist/cv-claude-channel.js",
