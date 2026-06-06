@@ -42,7 +42,7 @@ import {
   init as initApi,
   whoami, getReactions, addReaction, markRead,
   sendMessage, getRecentMessages, getShareLink, attachmentFromString,
-  downloadAttachmentsToDir,
+  downloadAttachmentsToDir, downloadShareLinkAttachmentsToDir,
   createConnection,
   type CVConnection,
   type CVMessageEvent,
@@ -181,7 +181,11 @@ to access them (e.g. to view an image, parse a document, or read a file).
 
 If the message is a forward, the body begins with:
   [Forwarded message from <original_sender_id>]
-  <original transcript>
+  <original transcript, or "(no transcript)" if the original was file-only>
+
+  Attachments:
+  - filename (mime_type): /absolute/local/path
+  (this Attachments block is only present when the original message had files)
 
   [Forwarded by <forwarder_id>]
   <forwarder's comment, if any>
@@ -789,9 +793,49 @@ async function processMessage(event: CVMessageEvent): Promise<boolean | null> {
         m => m.type === 'transcript_with_timecode' || m.type === 'transcript',
       )
       const smTranscript = smTm?.timecodes?.map(tc => tc.t).join(' ') || smTm?.value || ''
+
+      const smAttachments: CVAttachment[] = sm.attachments ?? []
+      if (smAttachments.length > 0) {
+        log(`cv-claude-channels: forwarded message ${sm.message_id} has ${smAttachments.length} attachment(s)\n`)
+      }
+      const smLocalPaths = smAttachments.length > 0
+        ? await downloadShareLinkAttachmentsToDir(
+            event.share_link_id,
+            smAttachments,
+            path.join(ATTACHMENTS_DIR, sm.message_id),
+          ).catch((err: unknown) => {
+            log(`cv-claude-channels: failed to download forwarded attachments for ${sm.message_id}: ${err}\n`)
+            return new Map<string, string>()
+          })
+        : new Map<string, string>()
+
+      // If any uploaded forwarded attachment couldn't be downloaded, retry rather than
+      // marking the message processed — the reaction dedup would otherwise block any retry.
+      const uploadedSmAttachments = smAttachments.filter(a => a.type === 'file' && a.status === 'Uploaded')
+      if (uploadedSmAttachments.some(a => !smLocalPaths.has(a._id))) {
+        log(`cv-claude-channels: forwarded attachment download incomplete for ${sm.message_id}, will retry\n`)
+        return null
+      }
+
+      const smAttachmentLines = smAttachments
+        .map(a => {
+          if (a.type === 'file' && a.status === 'Failed') {
+            const label = a.filename ?? a.mime_type ?? 'file'
+            return `- ${label}: (upload failed)`
+          }
+          const ref = a.type === 'file' ? smLocalPaths.get(a._id) : a.link
+          if (!ref) return null
+          const label = a.filename ? `${a.filename} (${a.mime_type ?? a.type})` : (a.mime_type ?? a.type)
+          return `- ${label}: ${ref}`
+        })
+        .filter((line): line is string => line !== null)
+
+      const smContent = smTranscript || '(no transcript)'
       forwardedSection =
         `[Forwarded message from ${sm.creator_id}]\n` +
-        (smTranscript || '(no transcript)')
+        (smAttachmentLines.length > 0
+          ? `${smContent}\n\nAttachments:\n${smAttachmentLines.join('\n')}`
+          : smContent)
     } else {
       log(`cv-claude-channels: share-link lookup yielded no content for ${event.message_id}, will retry\n`)
       return null

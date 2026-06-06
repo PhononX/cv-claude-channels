@@ -340,6 +340,38 @@ export async function resolveAttachmentUrls(
   return new Map(results.map(r => [r.attachment_id, r.signed_url]))
 }
 
+export async function getShareLinkAttachmentSignedUrl(shareLinkId: string, attachmentId: string): Promise<string> {
+  const res = await cvFetch('GET', `/message-sharelinks/${shareLinkId}/attachments/signedurl/${attachmentId}`)
+  if (!res.ok) throw new Error(`CV share-link attachment signedurl failed ${res.status}: ${attachmentId}`)
+  return res.text()
+}
+
+export async function downloadShareLinkAttachmentsToDir(
+  shareLinkId: string,
+  attachments: CVAttachment[],
+  destDir: string,
+): Promise<Map<string, string>> {
+  const uploaded = attachments.filter(a => a.type === 'file' && a.status === 'Uploaded')
+  if (uploaded.length === 0) return new Map()
+
+  await fs.mkdir(destDir, { recursive: true })
+
+  const localPaths = new Map<string, string>()
+  await Promise.all(
+    uploaded.map(async (attachment) => {
+      const signedUrl = await getShareLinkAttachmentSignedUrl(shareLinkId, attachment._id)
+      const filename = path.basename(attachment.filename ?? attachment._id)
+      const destPath = path.join(destDir, filename)
+      const dlRes = await fetch(signedUrl)
+      if (!dlRes.ok) throw new Error(`share-link attachment download failed ${dlRes.status}: ${attachment._id}`)
+      await fs.writeFile(destPath, Buffer.from(await dlRes.arrayBuffer()))
+      localPaths.set(attachment._id, destPath)
+    }),
+  )
+
+  return localPaths
+}
+
 export async function downloadAttachmentsToDir(
   attachments: CVAttachment[],
   destDir: string,
