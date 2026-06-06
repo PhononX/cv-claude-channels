@@ -109,7 +109,7 @@ interface State {
   access: Access                        // file-backed allowlist
   unknownSenderSeen: Set<string>        // senders already notified this session (avoid spam)
   pendingAllowContext: Map<string, { channelId: string; messageId: string }>  // context for allow confirmation
-  pendingAttachments: Map<string, { channelId: string; replyToId: string; senderId: string; deadline: number; nudgeAt: number; nudgeSent: boolean; filenames: string[] }>
+  pendingAttachments: Map<string, { channelId: string; replyToId: string; senderId: string; deadline: number; nudgeAt: number; nudgeSent: boolean; filenames: string[]; createdAt: string }>
   attachmentFollowUpSent: Set<string>  // message IDs for which attachment follow-up has been sent
   pendingPermissionMessages: Map<string, { requestId: string; channelId: string; toolName: string }>  // cvMessageId → permission request
   allowAlwaysTools: Set<string>           // tools auto-approved for this session
@@ -877,6 +877,7 @@ async function processMessage(event: CVMessageEvent): Promise<boolean | null> {
         nudgeAt: now + ATTACHMENT_NUDGE_MS,
         nudgeSent: false,
         filenames,
+        createdAt: event.created_at,
       })
       log(`cv-claude-channels: registered ${event.message_id} for attachment follow-up (deadline ${ATTACHMENT_TIMEOUT_MS}ms)\n`)
     }
@@ -956,14 +957,28 @@ async function checkPendingAttachments(polledMessages: CVMessageEvent[]): Promis
   const updatedById = new Map(polledMessages.map(m => [m.message_id, m]))
 
   for (const [messageId, pending] of state.pendingAttachments) {
-    const updated = updatedById.get(messageId)
+    let updated = updatedById.get(messageId)
+    if (!updated) {
+      const justBefore = new Date(new Date(pending.createdAt).getTime() - 1).toISOString()
+      const refetch = await getRecentMessages({
+        date: justBefore,
+        direction: 'newer',
+        limit: 10,
+        use_last_updated: true,
+        ...(CONVERSATION_ID ? { channel_id: CONVERSATION_ID } : {}),
+      })
+      if (refetch.ok) {
+        updated = refetch.messages.find(m => m.message_id === messageId)
+        if (updated) log(`cv-claude-channels: refetched ${messageId} for attachment status check\n`)
+      }
+    }
     const timedOut = now >= pending.deadline
 
     const attachments = updated?.attachments ?? []
     const fileAttachments = attachments.filter(a => a.type === 'file')
     const stillPending = updated
       ? fileAttachments.some(a => a.status === 'Initializing' || a.status === 'Uploading')
-      : true  // not in this batch yet, assume still pending
+      : !timedOut  // fetch failed — keep waiting unless deadline passed
 
     // Send nudge if we've been waiting more than nudge threshold and haven't nudged yet
     if (!pending.nudgeSent && now >= pending.nudgeAt && stillPending && !timedOut) {
