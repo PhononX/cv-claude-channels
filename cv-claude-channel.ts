@@ -1023,6 +1023,7 @@ async function checkPendingAttachments(polledMessages: CVMessageEvent[]): Promis
           },
         },
       })
+      state.attachmentFollowUpSent.add(messageId)
     } catch (err) {
       log(`cv-claude-channels: attachment follow-up notification failed for ${messageId}: ${err}\n`)
       // Re-register with original deadline so we retry on the next poll
@@ -1164,7 +1165,7 @@ async function fetchMissedMessagesOnce() {
   }
 
   await checkPendingPermissions(allMessages)
-  await checkPendingAttachments(allMessages)
+  await checkPendingAttachments(messages)
 
   // Advance cursor as far as possible:
   // - No retries: advance to requestStartedAt (current time).
