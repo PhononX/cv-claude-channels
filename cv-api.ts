@@ -46,10 +46,31 @@ export interface CVMessageEvent {
   text_models: Array<{ type: string; value: string; timecodes?: CVTimecode[] }>
   attachments?: CVAttachment[]
   parent_message_id: string | null
+  share_link_id?: string | null
   created_at: string
   is_text_message: boolean
   status: string
   reaction_summary?: CVReactionSummary
+}
+
+export interface CVSharedMessage {
+  message_id: string
+  creator_id: string
+  channel_ids?: string[]
+  workspace_ids?: string[]
+  text_models: Array<{ type: string; value: string; timecodes?: CVTimecode[] }>
+  attachments?: CVAttachment[]
+  duration_ms?: number
+  created_at?: string
+}
+
+export interface CVShareLink {
+  share_type: 'forward' | 'link' | string
+  created_by: string
+  end_access_at?: string | null
+  revoked_at?: string | null
+  has_channel_access?: boolean
+  shared_message?: CVSharedMessage
 }
 
 export interface Reaction {
@@ -79,6 +100,7 @@ interface AttachmentPayload {
   link: string
   filename?: string
   mime_type?: string
+  length_in_bytes?: number
   status?: string
   percent_complete?: number
 }
@@ -188,7 +210,9 @@ export async function sendMessage(params: {
 
   const resolvedFiles = await Promise.all(fileAttachments.map(async a => {
     const abs = path.isAbsolute(a.path) ? a.path : path.resolve(process.cwd(), a.path)
-    return { ...a, path: await resolveActualPath(abs) }
+    const resolvedPath = await resolveActualPath(abs)
+    const { size } = await fs.stat(resolvedPath)
+    return { ...a, path: resolvedPath, size }
   }))
 
   const signedUrls = resolvedFiles.length > 0
@@ -204,6 +228,7 @@ export async function sendMessage(params: {
     link: baseUrls[i],
     filename: a.filename,
     mime_type: a.mime_type,
+    length_in_bytes: a.size,
     status: 'Initializing',
     percent_complete: 0,
   }))
@@ -237,6 +262,7 @@ export async function sendMessage(params: {
         link: baseUrls[i],
         filename: resolvedFiles[i].filename,
         mime_type: resolvedFiles[i].mime_type,
+        length_in_bytes: resolvedFiles[i].size,
       }
       await updateAttachment(messageId, attachmentId, { ...base, status: 'Uploading', percent_complete: 0 })
       try {
@@ -265,6 +291,15 @@ export async function getRecentMessages(params: {
   if (!res.ok) return { ok: false, status: res.status, messages: [] }
   const data = await res.json() as CVMessageEvent[]
   return { ok: true, status: res.status, messages: Array.isArray(data) ? data : [] }
+}
+
+export async function getShareLink(shareLinkId: string): Promise<CVShareLink | null> {
+  const res = await cvFetch('GET', `/v3/message-sharelinks/${shareLinkId}`)
+  if (!res.ok) {
+    _log(`cv-claude-channels: GET /v3/message-sharelinks/${shareLinkId} failed ${res.status}\n`)
+    return null
+  }
+  return res.json() as Promise<CVShareLink>
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -319,7 +354,7 @@ export async function downloadAttachmentsToDir(
   await Promise.all(
     results.map(async ({ attachment_id, signed_url }) => {
       const attachment = uploaded.find(a => a._id === attachment_id)
-      const filename = attachment?.filename ?? attachment_id
+      const filename = path.basename(attachment?.filename ?? attachment_id)
       const destPath = path.join(destDir, filename)
       const res = await fetch(signed_url)
       if (!res.ok) throw new Error(`attachment download failed ${res.status}: ${attachment_id}`)
@@ -350,6 +385,7 @@ export async function updateAttachment(
     link: string
     filename: string
     mime_type: string
+    length_in_bytes?: number
     status: string
     percent_complete: number
   },
@@ -494,7 +530,10 @@ export function createConnection(
       }) => {
         const payloadChannel = payload?.channel_id ?? payload?.channel_ids?.[0] ?? 'unknown'
         _log(`cv-claude-channels: WS event (status=${payload?.status} channel=${payloadChannel}) raw=${JSON.stringify(payload)}\n`)
-        if (payload?.status !== 'active') return
+        if (payload?.status !== 'active') {
+          _log(`cv-claude-channels: WS event filtered out (status=${payload?.status})\n`)
+          return
+        }
 
         if (opts.conversationId && payloadChannel !== 'unknown' && payloadChannel !== opts.conversationId) {
           _log(`cv-claude-channels: WS event skipped (wrong channel)\n`)
