@@ -361,7 +361,9 @@ export async function downloadShareLinkAttachmentsToDir(
     uploaded.map(async (attachment) => {
       const signedUrl = await getShareLinkAttachmentSignedUrl(shareLinkId, attachment._id)
       const filename = path.basename(attachment.filename ?? attachment._id)
-      const destPath = path.join(destDir, filename)
+      const ext = path.extname(filename)
+      const stem = path.basename(filename, ext)
+      const destPath = path.join(destDir, `${stem}_${attachment._id}${ext}`)
       const dlRes = await fetch(signedUrl)
       if (!dlRes.ok) throw new Error(`share-link attachment download failed ${dlRes.status}: ${attachment._id}`)
       await fs.writeFile(destPath, Buffer.from(await dlRes.arrayBuffer()))
@@ -387,7 +389,9 @@ export async function downloadAttachmentsToDir(
     results.map(async ({ attachment_id, signed_url }) => {
       const attachment = uploaded.find(a => a._id === attachment_id)
       const filename = path.basename(attachment?.filename ?? attachment_id)
-      const destPath = path.join(destDir, filename)
+      const ext = path.extname(filename)
+      const stem = path.basename(filename, ext)
+      const destPath = path.join(destDir, `${stem}_${attachment_id}${ext}`)
       const res = await fetch(signed_url)
       if (!res.ok) throw new Error(`attachment download failed ${res.status}: ${attachment_id}`)
       await fs.writeFile(destPath, Buffer.from(await res.arrayBuffer()))
