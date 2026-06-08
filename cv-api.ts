@@ -24,16 +24,53 @@ export interface CVReactionSummary {
   top_user_reactions: Array<{ user_id: string; reaction_id: string }>
 }
 
+export interface CVAttachment {
+  _id: string
+  client_id?: string
+  creator_id?: string
+  created_at?: string
+  type: 'link' | 'file'
+  link: string
+  filename?: string
+  mime_type?: string
+  length_in_bytes?: number
+  status?: 'Initializing' | 'Uploading' | 'Uploaded' | 'Failed' | string
+  percent_complete?: number
+}
+
 export interface CVMessageEvent {
   message_id: string
   channel_ids: string[]
   creator_id: string
+  last_updated_at?: string
   text_models: Array<{ type: string; value: string; timecodes?: CVTimecode[] }>
+  attachments?: CVAttachment[]
   parent_message_id: string | null
+  share_link_id?: string | null
   created_at: string
   is_text_message: boolean
   status: string
   reaction_summary?: CVReactionSummary
+}
+
+export interface CVSharedMessage {
+  message_id: string
+  creator_id: string
+  channel_ids?: string[]
+  workspace_ids?: string[]
+  text_models: Array<{ type: string; value: string; timecodes?: CVTimecode[] }>
+  attachments?: CVAttachment[]
+  duration_ms?: number
+  created_at?: string
+}
+
+export interface CVShareLink {
+  share_type: 'forward' | 'link' | string
+  created_by: string
+  end_access_at?: string | null
+  revoked_at?: string | null
+  has_channel_access?: boolean
+  shared_message?: CVSharedMessage
 }
 
 export interface Reaction {
@@ -63,6 +100,7 @@ interface AttachmentPayload {
   link: string
   filename?: string
   mime_type?: string
+  length_in_bytes?: number
   status?: string
   percent_complete?: number
 }
@@ -172,11 +210,13 @@ export async function sendMessage(params: {
 
   const resolvedFiles = await Promise.all(fileAttachments.map(async a => {
     const abs = path.isAbsolute(a.path) ? a.path : path.resolve(process.cwd(), a.path)
-    return { ...a, path: await resolveActualPath(abs) }
+    const resolvedPath = await resolveActualPath(abs)
+    const { size } = await fs.stat(resolvedPath)
+    return { ...a, path: resolvedPath, size }
   }))
 
   const signedUrls = resolvedFiles.length > 0
-    ? await Promise.all(resolvedFiles.map(a => getSignedUrl(`${crypto.randomUUID()}-${a.filename}`, a.mime_type)))
+    ? await Promise.all(resolvedFiles.map(a => getUploadSignedUrl(a.filename, a.mime_type, crypto.randomUUID())))
     : []
   const baseUrls = signedUrls.map(u => u.split('?')[0])
   const s3Uploads = resolvedFiles.map((a, i) => uploadToS3(signedUrls[i], a.path, a.mime_type))
@@ -188,6 +228,7 @@ export async function sendMessage(params: {
     link: baseUrls[i],
     filename: a.filename,
     mime_type: a.mime_type,
+    length_in_bytes: a.size,
     status: 'Initializing',
     percent_complete: 0,
   }))
@@ -221,6 +262,7 @@ export async function sendMessage(params: {
         link: baseUrls[i],
         filename: resolvedFiles[i].filename,
         mime_type: resolvedFiles[i].mime_type,
+        length_in_bytes: resolvedFiles[i].size,
       }
       await updateAttachment(messageId, attachmentId, { ...base, status: 'Uploading', percent_complete: 0 })
       try {
@@ -251,17 +293,113 @@ export async function getRecentMessages(params: {
   return { ok: true, status: res.status, messages: Array.isArray(data) ? data : [] }
 }
 
+export async function getShareLink(shareLinkId: string): Promise<CVShareLink | null> {
+  const res = await cvFetch('GET', `/v3/message-sharelinks/${shareLinkId}`)
+  if (!res.ok) {
+    _log(`cv-claude-channels: GET /v3/message-sharelinks/${shareLinkId} failed ${res.status}\n`)
+    return null
+  }
+  return res.json() as Promise<CVShareLink>
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // ATTACHMENTS
 // ─────────────────────────────────────────────────────────────────────────────
 
-export async function getSignedUrl(filename: string, mime_type: string): Promise<string> {
-  const res = await cvFetch('POST', '/v3/attachments/signedurl', {
-    files: [{ filename, mimetype: mime_type }],
+export async function getUploadSignedUrl(filename: string, mime_type: string, idempotency_key: string): Promise<string> {
+  const res = await cvFetch('POST', '/v5/attachments/upload/signedurl', {
+    files: [{ filename, mimetype: mime_type, idempotency_key }],
   })
-  if (!res.ok) throw new Error(`CV signedurl failed ${res.status}: ${await res.text()}`)
+  if (!res.ok) throw new Error(`CV upload signedurl failed ${res.status}: ${await res.text()}`)
   const data = await res.json() as Array<{ url: string }>
   return data[0].url
+}
+
+export async function getDownloadSignedUrl(attachmentId: string): Promise<string> {
+  const res = await cvFetch('GET', `/v5/attachments/download/signedurl/${attachmentId}`)
+  if (!res.ok) throw new Error(`CV attachment download signedurl failed ${res.status}`)
+  return res.text()
+}
+
+export async function getDownloadSignedUrls(
+  ids: string[],
+): Promise<Array<{ attachment_id: string; signed_url: string }>> {
+  const res = await cvFetch('POST', '/v5/attachments/download/signedurl/bulk', { ids })
+  if (!res.ok) throw new Error(`CV attachment download bulk signedurl failed ${res.status}`)
+  return res.json() as Promise<Array<{ attachment_id: string; signed_url: string }>>
+}
+
+export async function resolveAttachmentUrls(
+  attachments: CVAttachment[],
+): Promise<Map<string, string>> {
+  const uploadedIds = attachments
+    .filter(a => a.type === 'file' && a.status === 'Uploaded')
+    .map(a => a._id)
+  if (uploadedIds.length === 0) return new Map()
+  const results = await getDownloadSignedUrls(uploadedIds)
+  return new Map(results.map(r => [r.attachment_id, r.signed_url]))
+}
+
+export async function getShareLinkAttachmentSignedUrl(shareLinkId: string, attachmentId: string): Promise<string> {
+  const res = await cvFetch('GET', `/message-sharelinks/${shareLinkId}/attachments/signedurl/${attachmentId}`)
+  if (!res.ok) throw new Error(`CV share-link attachment signedurl failed ${res.status}: ${attachmentId}`)
+  return res.text()
+}
+
+export async function downloadShareLinkAttachmentsToDir(
+  shareLinkId: string,
+  attachments: CVAttachment[],
+  destDir: string,
+): Promise<Map<string, string>> {
+  const uploaded = attachments.filter(a => a.type === 'file' && a.status === 'Uploaded')
+  if (uploaded.length === 0) return new Map()
+
+  await fs.mkdir(destDir, { recursive: true })
+
+  const localPaths = new Map<string, string>()
+  await Promise.all(
+    uploaded.map(async (attachment) => {
+      const signedUrl = await getShareLinkAttachmentSignedUrl(shareLinkId, attachment._id)
+      const filename = path.basename(attachment.filename ?? attachment._id)
+      const ext = path.extname(filename)
+      const stem = path.basename(filename, ext)
+      const destPath = path.join(destDir, `${stem}_${attachment._id}${ext}`)
+      const dlRes = await fetch(signedUrl)
+      if (!dlRes.ok) throw new Error(`share-link attachment download failed ${dlRes.status}: ${attachment._id}`)
+      await fs.writeFile(destPath, Buffer.from(await dlRes.arrayBuffer()))
+      localPaths.set(attachment._id, destPath)
+    }),
+  )
+
+  return localPaths
+}
+
+export async function downloadAttachmentsToDir(
+  attachments: CVAttachment[],
+  destDir: string,
+): Promise<Map<string, string>> {
+  const uploaded = attachments.filter(a => a.type === 'file' && a.status === 'Uploaded')
+  if (uploaded.length === 0) return new Map()
+
+  const results = await getDownloadSignedUrls(uploaded.map(a => a._id))
+  await fs.mkdir(destDir, { recursive: true })
+
+  const localPaths = new Map<string, string>()
+  await Promise.all(
+    results.map(async ({ attachment_id, signed_url }) => {
+      const attachment = uploaded.find(a => a._id === attachment_id)
+      const filename = path.basename(attachment?.filename ?? attachment_id)
+      const ext = path.extname(filename)
+      const stem = path.basename(filename, ext)
+      const destPath = path.join(destDir, `${stem}_${attachment_id}${ext}`)
+      const res = await fetch(signed_url)
+      if (!res.ok) throw new Error(`attachment download failed ${res.status}: ${attachment_id}`)
+      await fs.writeFile(destPath, Buffer.from(await res.arrayBuffer()))
+      localPaths.set(attachment_id, destPath)
+    }),
+  )
+
+  return localPaths
 }
 
 export async function uploadToS3(url: string, filePath: string, mime_type: string): Promise<void> {
@@ -283,6 +421,7 @@ export async function updateAttachment(
     link: string
     filename: string
     mime_type: string
+    length_in_bytes?: number
     status: string
     percent_complete: number
   },
@@ -427,7 +566,10 @@ export function createConnection(
       }) => {
         const payloadChannel = payload?.channel_id ?? payload?.channel_ids?.[0] ?? 'unknown'
         _log(`cv-claude-channels: WS event (status=${payload?.status} channel=${payloadChannel}) raw=${JSON.stringify(payload)}\n`)
-        if (payload?.status !== 'active') return
+        if (payload?.status !== 'active') {
+          _log(`cv-claude-channels: WS event filtered out (status=${payload?.status})\n`)
+          return
+        }
 
         if (opts.conversationId && payloadChannel !== 'unknown' && payloadChannel !== opts.conversationId) {
           _log(`cv-claude-channels: WS event skipped (wrong channel)\n`)

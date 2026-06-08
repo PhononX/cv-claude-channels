@@ -15,7 +15,8 @@
  *       "args": ["tsx", "./cv-claude-channel.ts"],
  *       "env": {
  *         "CV_PAT": "your-personal-access-token",
- *         "CV_CONVERSATION_ID": ""  // optional: scope to one conversation guid; omit to receive all
+ *         "CV_CONVERSATION_ID": "",      // optional: scope to one conversation guid; omit to receive all
+ *         "CV_ATTACHMENTS_DIR": ""       // optional: folder for downloaded attachments; defaults to ~/.claude/channels/cv/attachments
  *       }
  *     }
  *   }
@@ -40,10 +41,12 @@ import * as os from 'node:os'
 import {
   init as initApi,
   whoami, getReactions, addReaction, markRead,
-  sendMessage, getRecentMessages, attachmentFromString,
+  sendMessage, getRecentMessages, getShareLink, attachmentFromString,
+  downloadAttachmentsToDir, downloadShareLinkAttachmentsToDir,
   createConnection,
   type CVConnection,
   type CVMessageEvent,
+  type CVAttachment,
 } from './cv-api.js'
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -53,21 +56,30 @@ import {
 const PAT                  = process.env.CV_PAT ?? ''
 const CONVERSATION_ID      = process.env.CV_CONVERSATION_ID ?? ''   // optional: scope to one conversation
 const REACTION_ID          = process.env.CV_REACTION_ID ?? ''       // optional: pin a specific reaction ID
-const POLL_INTERVAL_MS     = Number(process.env.CV_POLL_INTERVAL_MS  ?? 5_000)
-const WS_RETRY_MAX_MS      = Number(process.env.CV_WS_RETRY_MAX_MS   ?? 30_000)
+const POLL_INTERVAL_MS          = Number(process.env.CV_POLL_INTERVAL_MS           ?? 5_000)
+const WS_RETRY_MAX_MS           = Number(process.env.CV_WS_RETRY_MAX_MS            ?? 30_000)
+const ATTACHMENT_TIMEOUT_MS     = Number(process.env.CV_ATTACHMENT_TIMEOUT_MS      ?? 600_000)
+const ATTACHMENT_NUDGE_MS       = Number(process.env.CV_ATTACHMENT_NUDGE_MS        ?? 120_000)
+const PERMISSION_ALLOW_REACTION        = process.env.CV_PERMISSION_ALLOW_REACTION        ?? 'acknowledged'
+const PERMISSION_ALLOW_ALWAYS_REACTION = process.env.CV_PERMISSION_ALLOW_ALWAYS_REACTION ?? 'affirmative'
+const PERMISSION_DENY_REACTION         = process.env.CV_PERMISSION_DENY_REACTION         ?? 'negative'
 const STATE_PATH           = process.env.CV_STATE_PATH
   ?? path.join(os.homedir(), '.claude', 'channels', 'cv', `state${CONVERSATION_ID ? `-${CONVERSATION_ID}` : ''}.json`)
 const ACCESS_PATH          = process.env.CV_ACCESS_PATH
   ?? path.join(os.homedir(), '.claude', 'channels', 'cv', 'access.json')
+const ATTACHMENTS_DIR      = process.env.CV_ATTACHMENTS_DIR
+  ?? path.join(os.homedir(), '.claude', 'channels', 'cv', 'attachments')
 const PROJECT_NAME         = process.env.CV_PROJECT_NAME ?? 'this project'
 const LOG_FILE             = process.env.CV_LOG_FILE ?? ''
 
+const timestamp = () => new Date().toISOString().replace('T', ' ').replace('Z', '')
 const log = LOG_FILE
   ? (msg: string) => {
-      fs.appendFile(LOG_FILE, msg).catch(() => {})
-      process.stderr.write(msg)
+      const stamped = msg.replace(/^(cv-claude-channels: )/, `$1[${timestamp()}] `)
+      fs.appendFile(LOG_FILE, stamped).catch(() => {})
+      process.stderr.write(stamped)
     }
-  : (msg: string) => process.stderr.write(msg)
+  : (msg: string) => process.stderr.write(msg.replace(/^(cv-claude-channels: )/, `$1[${timestamp()}] `))
 
 if (!PAT) {
   log('cv-claude-channels: CV_PAT is required\n')
@@ -97,6 +109,11 @@ interface State {
   access: Access                        // file-backed allowlist
   unknownSenderSeen: Set<string>        // senders already notified this session (avoid spam)
   pendingAllowContext: Map<string, { channelId: string; messageId: string }>  // context for allow confirmation
+  pendingAttachments: Map<string, { channelId: string; replyToId: string; senderId: string; deadline: number; nudgeAt: number; nudgeSent: boolean; filenames: string[]; createdAt: string }>
+  attachmentFollowUpSent: Set<string>  // message IDs for which attachment follow-up has been sent
+  pendingPermissionMessages: Map<string, { requestId: string; channelId: string; toolName: string }>  // cvMessageId → permission request
+  allowAlwaysTools: Set<string>           // tools auto-approved for this session
+  permissionReactionIds: { allow: string | null; allowAlways: string | null; deny: string | null }
   cvStarted: boolean                    // true once startup() has been called
 }
 
@@ -117,6 +134,11 @@ const state: State = {
   access: { allowFrom: [], blockedFrom: [] },
   unknownSenderSeen: new Set(),
   pendingAllowContext: new Map(),
+  pendingAttachments: new Map(),
+  attachmentFollowUpSent: new Set(),
+  pendingPermissionMessages: new Map(),
+  allowAlwaysTools: new Set(),
+  permissionReactionIds: { allow: null, allowAlways: null, deny: null },
   cvStarted: false,
 }
 
@@ -148,7 +170,25 @@ Each message arrives as a <channel> tag with these attributes:
   reply_to_id      — the message ID to thread your reply under
                      (use this, not message_id, when calling send_message)
 
-The tag body is the transcript of what was said.
+The tag body is the transcript of what was said. If the message includes
+attachments, they appear after the transcript in the body, formatted as:
+
+  Attachments:
+  - filename (mime_type): /absolute/local/path
+
+Attachment files have been downloaded to a local directory. Use the Read tool
+to access them (e.g. to view an image, parse a document, or read a file).
+
+If the message is a forward, the body begins with:
+  [Forwarded message from <original_sender_id>]
+  <original transcript, or "(no transcript)" if the original was file-only>
+
+  Attachments:
+  - filename (mime_type): /absolute/local/path
+  (this Attachments block is only present when the original message had files)
+
+  [Forwarded by <forwarder_id>]
+  <forwarder's comment, if any>
 
 To reply, call the send_message tool with:
   channel_id       — from the <channel> tag
@@ -410,6 +450,21 @@ mcp.setNotificationHandler(PermissionRequestSchema, async ({ params }) => {
   // them via send_message creates an unresolvable loop.
   if (['send_message', 'list_senders', 'allow_sender', 'remove_sender', 'block_sender', 'confirm_channels'].some(t => params.tool_name === t || params.tool_name.endsWith(`__${t}`))) return
 
+  // Auto-approve tools the user has already said "always allow" to this session
+  if (state.allowAlwaysTools.has(params.tool_name)) {
+    log(`cv-claude-channels: auto-approving ${params.tool_name} (allow_always in session)\n`)
+    try {
+      await mcp.notification({
+        method: 'notifications/claude/channel/permission',
+        params: { request_id: params.request_id, behavior: 'allow' },
+      })
+      log(`cv-claude-channels: auto-approve confirmed to Claude for ${params.tool_name} (request_id=${params.request_id})\n`)
+    } catch (err) {
+      log(`cv-claude-channels: auto-approve notification failed for ${params.request_id}: ${err}\n`)
+    }
+    return
+  }
+
   const ctx = state.lastCVContext
   if (!ctx) {
     log(`cv-claude-channels: permission request for ${params.tool_name} but no CV context to relay to\n`)
@@ -418,15 +473,21 @@ mcp.setNotificationHandler(PermissionRequestSchema, async ({ params }) => {
 
   const text =
     `Claude wants to run ${params.tool_name}: ${params.description}\n\n` +
-    `Reply "yes ${params.request_id}" or "no ${params.request_id}" to grant or deny permission.`
+    `✅ = allow once. 💯 = always allow. 👎 = deny. ` +
+    `Or reply "yes ${params.request_id}" or "no ${params.request_id}".`
 
   try {
-    await sendMessage({
+    const cvMessageId = await sendMessage({
       conversationId: ctx.channelId,
       threadId: ctx.replyToId,
       transcript: text,
     })
-    log(`cv-claude-channels: permission request for ${params.tool_name} relayed to CV (request_id=${params.request_id})\n`)
+    state.pendingPermissionMessages.set(cvMessageId, {
+      requestId: params.request_id,
+      channelId: ctx.channelId,
+      toolName: params.tool_name,
+    })
+    log(`cv-claude-channels: permission request for ${params.tool_name} relayed to CV (request_id=${params.request_id} cvMessageId=${cvMessageId})\n`)
   } catch (err) {
     log(`cv-claude-channels: permission relay send failed for ${params.request_id}: ${err}\n`)
   }
@@ -489,6 +550,28 @@ async function loadReaction() {
   }
 
   log(`cv-claude-channels: using reaction id=${state.reactionId}\n`)
+
+  // Resolve the three permission-approval reaction IDs
+  const resolvePermReaction = (nameOrId: string): string | null => {
+    const byId = reactions.find(r => r.id === nameOrId)
+    if (byId) return byId.id
+    const byCode = reactions.find(
+      r => r.code === nameOrId || r.name.toLowerCase() === nameOrId.toLowerCase(),
+    )
+    if (byCode) {
+      log(`cv-claude-channels: resolved permission reaction "${nameOrId}" → id="${byCode.id}"\n`)
+      return byCode.id
+    }
+    log(`cv-claude-channels: WARNING: permission reaction "${nameOrId}" not found\n`)
+    return null
+  }
+
+  state.permissionReactionIds = {
+    allow:      resolvePermReaction(PERMISSION_ALLOW_REACTION),
+    allowAlways: resolvePermReaction(PERMISSION_ALLOW_ALWAYS_REACTION),
+    deny:       resolvePermReaction(PERMISSION_DENY_REACTION),
+  }
+  log(`cv-claude-channels: permission reactions: allow=${state.permissionReactionIds.allow} allowAlways=${state.permissionReactionIds.allowAlways} deny=${state.permissionReactionIds.deny}\n`)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -655,8 +738,118 @@ async function processMessage(event: CVMessageEvent): Promise<boolean | null> {
   // Terminal statuses will never produce a transcript — skip them
   if (!transcript && (event.status === 'canceled' || event.status === 'deleted')) return false
 
+  const hasAttachments = (event.attachments?.length ?? 0) > 0
+
   // Not ready yet — let the next poll retry without marking seen
-  if (!transcript) return null
+  // Exceptions: attachment-only and forwarded messages have no transcript and never will
+  if (!transcript && !hasAttachments && !event.share_link_id) return null
+
+  const attachments: CVAttachment[] = event.attachments ?? []
+
+  if (attachments.length > 0) {
+    log(`cv-claude-channels: message ${event.message_id} has ${attachments.length} attachment(s): ${JSON.stringify(attachments.map(a => ({ _id: a._id, type: a.type, filename: a.filename, mime_type: a.mime_type, status: a.status })))}\n`)
+  }
+
+  // Download uploaded file attachments to a local directory for Claude to read directly.
+  const localPaths = await downloadAttachmentsToDir(
+    attachments,
+    path.join(ATTACHMENTS_DIR, event.message_id),
+  ).catch((err: unknown) => {
+    log(`cv-claude-channels: failed to download attachments for ${event.message_id}: ${err}\n`)
+    return new Map<string, string>()
+  })
+
+  const hasPendingUploads = attachments.some(
+    a => a.type === 'file' && (a.status === 'Initializing' || a.status === 'Uploading'),
+  )
+
+  const attachmentLines = attachments
+    .map(a => {
+      if (a.type === 'file' && (a.status === 'Initializing' || a.status === 'Uploading')) {
+        const label = a.filename ?? a.mime_type ?? 'file'
+        return `- ${label}: (uploading — follow-up will arrive when ready)`
+      }
+      if (a.type === 'file' && a.status === 'Failed') {
+        const label = a.filename ?? a.mime_type ?? 'file'
+        return `- ${label}: (upload failed)`
+      }
+      const ref = a.type === 'file' ? localPaths.get(a._id) : a.link
+      if (!ref) return null
+      const label = a.filename ? `${a.filename} (${a.mime_type ?? a.type})` : (a.mime_type ?? a.type)
+      return `- ${label}: ${ref}`
+    })
+    .filter((line): line is string => line !== null)
+
+  // Resolve forwarded message content if this is a forward
+  let forwardedSection = ''
+  if (event.share_link_id) {
+    const shareLink = await getShareLink(event.share_link_id).catch(err => {
+      log(`cv-claude-channels: getShareLink failed for ${event.share_link_id}: ${err}\n`)
+      return null
+    })
+    if (shareLink?.shared_message) {
+      const sm = shareLink.shared_message
+      const smTm = sm.text_models.find(
+        m => m.type === 'transcript_with_timecode' || m.type === 'transcript',
+      )
+      const smTranscript = smTm?.timecodes?.map(tc => tc.t).join(' ') || smTm?.value || ''
+
+      const smAttachments: CVAttachment[] = sm.attachments ?? []
+      if (smAttachments.length > 0) {
+        log(`cv-claude-channels: forwarded message ${sm.message_id} has ${smAttachments.length} attachment(s)\n`)
+      }
+      const smLocalPaths = smAttachments.length > 0
+        ? await downloadShareLinkAttachmentsToDir(
+            event.share_link_id,
+            smAttachments,
+            path.join(ATTACHMENTS_DIR, sm.message_id),
+          ).catch((err: unknown) => {
+            log(`cv-claude-channels: failed to download forwarded attachments for ${sm.message_id}: ${err}\n`)
+            return new Map<string, string>()
+          })
+        : new Map<string, string>()
+
+      // If any uploaded forwarded attachment couldn't be downloaded, retry rather than
+      // marking the message processed — the reaction dedup would otherwise block any retry.
+      const uploadedSmAttachments = smAttachments.filter(a => a.type === 'file' && a.status === 'Uploaded')
+      if (uploadedSmAttachments.some(a => !smLocalPaths.has(a._id))) {
+        log(`cv-claude-channels: forwarded attachment download incomplete for ${sm.message_id}, will retry\n`)
+        return null
+      }
+
+      const smAttachmentLines = smAttachments
+        .map(a => {
+          if (a.type === 'file' && a.status === 'Failed') {
+            const label = a.filename ?? a.mime_type ?? 'file'
+            return `- ${label}: (upload failed)`
+          }
+          const ref = a.type === 'file' ? smLocalPaths.get(a._id) : a.link
+          if (!ref) return null
+          const label = a.filename ? `${a.filename} (${a.mime_type ?? a.type})` : (a.mime_type ?? a.type)
+          return `- ${label}: ${ref}`
+        })
+        .filter((line): line is string => line !== null)
+
+      const smContent = smTranscript || '(no transcript)'
+      forwardedSection =
+        `[Forwarded message from ${sm.creator_id}]\n` +
+        (smAttachmentLines.length > 0
+          ? `${smContent}\n\nAttachments:\n${smAttachmentLines.join('\n')}`
+          : smContent)
+    } else {
+      log(`cv-claude-channels: share-link lookup yielded no content for ${event.message_id}, will retry\n`)
+      return null
+    }
+  }
+
+  const body = forwardedSection
+    ? (transcript
+        ? `${forwardedSection}\n\n[Forwarded by ${event.creator_id}]\n${transcript}`
+        : forwardedSection)
+    : (transcript || '(no transcript)')
+  const content = attachmentLines.length > 0
+    ? `${body}\n\nAttachments:\n${attachmentLines.join('\n')}`
+    : body
 
   const reply_to_id = event.parent_message_id ?? event.message_id
 
@@ -680,6 +873,13 @@ async function processMessage(event: CVMessageEvent): Promise<boolean | null> {
       return null
     }
 
+    for (const [cvMsgId, pending] of state.pendingPermissionMessages) {
+      if (pending.requestId === requestId) {
+        state.pendingPermissionMessages.delete(cvMsgId)
+        break
+      }
+    }
+
     await markProcessed(event)
     await markRead(channel_id, event.message_id)
     return true // handled as verdict, don't also forward as chat
@@ -690,7 +890,7 @@ async function processMessage(event: CVMessageEvent): Promise<boolean | null> {
     await mcp.notification({
       method: 'notifications/claude/channel',
       params: {
-        content: transcript,
+        content,
         meta: {
           source:        'carbon-voice',
           channel_id,
@@ -702,6 +902,29 @@ async function processMessage(event: CVMessageEvent): Promise<boolean | null> {
       },
     })
     state.lastCVContext = { channelId: channel_id, replyToId: reply_to_id }
+    // Mark messages whose attachments were fully delivered inline so the follow-up
+    // scanner doesn't re-send them.
+    if (localPaths.size > 0 && !hasPendingUploads) {
+      state.attachmentFollowUpSent.add(event.message_id)
+    }
+
+    if (hasPendingUploads) {
+      const now = Date.now()
+      const filenames = attachments
+        .filter(a => a.type === 'file' && (a.status === 'Initializing' || a.status === 'Uploading'))
+        .map(a => a.filename ?? a.mime_type ?? 'file')
+      state.pendingAttachments.set(event.message_id, {
+        channelId: channel_id,
+        replyToId: reply_to_id,
+        senderId: event.creator_id,
+        deadline: now + ATTACHMENT_TIMEOUT_MS,
+        nudgeAt: now + ATTACHMENT_NUDGE_MS,
+        nudgeSent: false,
+        filenames,
+        createdAt: event.created_at,
+      })
+      log(`cv-claude-channels: registered ${event.message_id} for attachment follow-up (deadline ${ATTACHMENT_TIMEOUT_MS}ms)\n`)
+    }
   } catch (err) {
     log(`cv-claude-channels: notification failed for ${event.message_id}, will retry: ${err}\n`)
     return null
@@ -710,6 +933,216 @@ async function processMessage(event: CVMessageEvent): Promise<boolean | null> {
   await markProcessed(event)
   await markRead(channel_id, event.message_id)
   return true
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PERMISSION REACTION APPROVALS
+// ─────────────────────────────────────────────────────────────────────────────
+
+
+async function checkPendingPermissions(messages: CVMessageEvent[]): Promise<void> {
+  if (state.pendingPermissionMessages.size === 0) return
+
+  const pendingIds = [...state.pendingPermissionMessages.keys()]
+  log(`cv-claude-channels: checkPendingPermissions: ${pendingIds.length} pending=${JSON.stringify(pendingIds)}, batch size=${messages.length}\n`)
+
+  const matched = messages.filter(m => state.pendingPermissionMessages.has(m.message_id))
+  log(`cv-claude-channels: checkPendingPermissions: ${matched.length} matched in batch (${matched.map(m => m.message_id).join(', ')})\n`)
+  for (const m of matched) {
+    log(`cv-claude-channels: checkPendingPermissions: message ${m.message_id} reactions=${JSON.stringify(m.reaction_summary?.top_user_reactions)}\n`)
+  }
+
+  const { allow, allowAlways, deny } = state.permissionReactionIds
+
+  for (const msg of messages) {
+    const pending = state.pendingPermissionMessages.get(msg.message_id)
+    if (!pending) continue
+
+    const reactions = msg.reaction_summary?.top_user_reactions ?? []
+    for (const rxn of reactions) {
+      if (!state.access.allowFrom.includes(rxn.user_id)) continue
+
+      let behavior: string | null = null
+      if (allow && rxn.reaction_id === allow) behavior = 'allow'
+      else if (allowAlways && rxn.reaction_id === allowAlways) behavior = 'allow_always'
+      else if (deny && rxn.reaction_id === deny) behavior = 'deny'
+
+      if (!behavior) continue
+
+      log(`cv-claude-channels: permission verdict via reaction: ${behavior} for request ${pending.requestId} (from ${rxn.user_id})\n`)
+
+      if (behavior === 'allow_always') {
+        state.allowAlwaysTools.add(pending.toolName)
+        log(`cv-claude-channels: ${pending.toolName} added to session allow_always list\n`)
+      }
+
+      try {
+        await mcp.notification({
+          method: 'notifications/claude/channel/permission',
+          params: { request_id: pending.requestId, behavior: behavior === 'allow_always' ? 'allow' : behavior },
+        })
+        state.pendingPermissionMessages.delete(msg.message_id)
+      } catch (err) {
+        log(`cv-claude-channels: permission reaction notification failed for ${pending.requestId}: ${err}\n`)
+      }
+      break
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ATTACHMENT FOLLOW-UP
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function checkPendingAttachments(polledMessages: CVMessageEvent[]): Promise<void> {
+  const now = Date.now()
+
+  // Build a lookup of updated messages from this poll batch
+  const updatedById = new Map(polledMessages.map(m => [m.message_id, m]))
+
+  for (const [messageId, pending] of state.pendingAttachments) {
+    let updated = updatedById.get(messageId)
+    if (!updated) {
+      const justBefore = new Date(new Date(pending.createdAt).getTime() - 1).toISOString()
+      const refetch = await getRecentMessages({
+        date: justBefore,
+        direction: 'newer',
+        limit: 100,
+        use_last_updated: true,
+        ...(CONVERSATION_ID ? { channel_id: CONVERSATION_ID } : {}),
+      })
+      if (refetch.ok) {
+        updated = refetch.messages.find(m => m.message_id === messageId)
+        if (updated) log(`cv-claude-channels: refetched ${messageId} for attachment status check\n`)
+      }
+    }
+    const timedOut = now >= pending.deadline
+
+    const attachments = updated?.attachments ?? []
+    const fileAttachments = attachments.filter(a => a.type === 'file')
+    const stillPending = updated
+      ? fileAttachments.some(a => a.status === 'Initializing' || a.status === 'Uploading')
+      : !timedOut  // fetch failed — keep waiting unless deadline passed
+
+    // Send nudge if we've been waiting more than nudge threshold and haven't nudged yet
+    if (!pending.nudgeSent && now >= pending.nudgeAt && stillPending && !timedOut) {
+      const names = pending.filenames.join(', ')
+      log(`cv-claude-channels: sending nudge for pending attachment(s) on ${messageId}\n`)
+      sendMessage({
+        conversationId: pending.channelId,
+        threadId: pending.replyToId,
+        transcript: `Still waiting on ${names} to finish uploading.`,
+      }).catch(err => log(`cv-claude-channels: nudge send failed for ${messageId}: ${err}\n`))
+      pending.nudgeSent = true
+    }
+
+    // Not resolved and not yet expired — keep waiting
+    if (stillPending && !timedOut) continue
+
+    state.pendingAttachments.delete(messageId)
+
+    // Download any uploaded files locally
+    const localPaths = await downloadAttachmentsToDir(
+      fileAttachments,
+      path.join(ATTACHMENTS_DIR, messageId),
+    ).catch((err: unknown) => {
+      log(`cv-claude-channels: follow-up download failed for ${messageId}: ${err}\n`)
+      return new Map<string, string>()
+    })
+
+    const lines = fileAttachments.map(a => {
+      if (a.status === 'Uploaded') {
+        const localPath = localPaths.get(a._id)
+        if (localPath) {
+          const label = a.filename ? `${a.filename} (${a.mime_type ?? a.type})` : (a.mime_type ?? a.type)
+          return `- ${label}: ${localPath}`
+        }
+      }
+      const label = a.filename ?? a.mime_type ?? 'file'
+      return `- ${label}: (upload ${timedOut && a.status !== 'Uploaded' ? 'timed out' : 'failed'})`
+    })
+
+    if (lines.length === 0) continue
+
+    log(`cv-claude-channels: sending attachment follow-up for ${messageId} (timedOut=${timedOut})\n`)
+
+    try {
+      await mcp.notification({
+        method: 'notifications/claude/channel',
+        params: {
+          content: `Attachment follow-up:\n${lines.join('\n')}`,
+          meta: {
+            source:               'carbon-voice',
+            channel_id:           pending.channelId,
+            message_id:           messageId,
+            sender_id:            pending.senderId,
+            is_reply:             'true',
+            reply_to_id:          pending.replyToId,
+            is_attachment_followup: 'true',
+          },
+        },
+      })
+      state.attachmentFollowUpSent.add(messageId)
+    } catch (err) {
+      log(`cv-claude-channels: attachment follow-up notification failed for ${messageId}: ${err}\n`)
+      // Re-register with original deadline so we retry on the next poll
+      state.pendingAttachments.set(messageId, pending)
+    }
+  }
+
+  // Second pass: catch messages that were processed with no attachments but later had
+  // attachments added (Carbon Voice adds the attachment to the message after the fact).
+  for (const event of polledMessages) {
+    if (!isProcessed(event)) continue
+    if (state.attachmentFollowUpSent.has(event.message_id)) continue
+    if (state.pendingAttachments.has(event.message_id)) continue  // already tracked above
+
+    const uploadedFiles = (event.attachments ?? []).filter(
+      a => a.type === 'file' && a.status === 'Uploaded',
+    )
+    if (uploadedFiles.length === 0) continue
+
+    state.attachmentFollowUpSent.add(event.message_id)
+    log(`cv-claude-channels: post-processed attachment(s) found for ${event.message_id}, sending follow-up\n`)
+
+    const localPaths = await downloadAttachmentsToDir(
+      uploadedFiles,
+      path.join(ATTACHMENTS_DIR, event.message_id),
+    ).catch((err: unknown) => {
+      log(`cv-claude-channels: follow-up download failed for ${event.message_id}: ${err}\n`)
+      return new Map<string, string>()
+    })
+
+    const lines = uploadedFiles.map(a => {
+      const localPath = localPaths.get(a._id)
+      const label = a.filename ? `${a.filename} (${a.mime_type ?? a.type})` : (a.mime_type ?? a.type)
+      return localPath ? `- ${label}: ${localPath}` : `- ${label}: (download unavailable)`
+    })
+
+    const channel_id = event.channel_ids[0] ?? ''
+    const reply_to_id = event.parent_message_id ?? event.message_id
+
+    try {
+      await mcp.notification({
+        method: 'notifications/claude/channel',
+        params: {
+          content: `Attachment follow-up:\n${lines.join('\n')}`,
+          meta: {
+            source:                 'carbon-voice',
+            channel_id,
+            message_id:             event.message_id,
+            sender_id:              event.creator_id,
+            is_reply:               'true',
+            reply_to_id,
+            is_attachment_followup: 'true',
+          },
+        },
+      })
+    } catch (err) {
+      log(`cv-claude-channels: post-processed follow-up failed for ${event.message_id}: ${err}\n`)
+      state.attachmentFollowUpSent.delete(event.message_id)  // retry next poll
+    }
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -789,6 +1222,9 @@ async function fetchMissedMessagesOnce() {
       '\n',
     )
   }
+
+  await checkPendingPermissions(allMessages)
+  await checkPendingAttachments(messages)
 
   // Advance cursor as far as possible:
   // - No retries: advance to requestStartedAt (current time).
