@@ -3,7 +3,9 @@ import * as path from 'node:path'
 import * as crypto from 'node:crypto'
 import { io, Socket } from 'socket.io-client'
 
-const CV_API_BASE = 'https://api.carbonvoice.app'
+// Defaults to production. Override (e.g. for local testing against staging/dev)
+// by setting CV_API_BASE — must match the environment the client app is on.
+const CV_API_BASE = process.env.CV_API_BASE ?? 'https://api.carbonvoice.app'
 
 let _pat = ''
 let _log: (msg: string) => void = (msg) => process.stderr.write(msg)
