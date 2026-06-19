@@ -11,6 +11,6 @@
     "declarationMap": true,
     "sourceMap": true
   },
-  "include": ["cv-claude-channel.ts"],
+  "include": ["cv-claude-channel.ts", "permission-ui.ts"],
   "exclude": ["node_modules", "dist"]
 }

@@ -47,7 +47,9 @@ import {
   type CVConnection,
   type CVMessageEvent,
   type CVAttachment,
+  type FileAttachment,
 } from './cv-api.js'
+import { buildPermissionUiAttachment } from './permission-ui.js'
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CONFIG
@@ -471,16 +473,34 @@ mcp.setNotificationHandler(PermissionRequestSchema, async ({ params }) => {
     return
   }
 
-  const text =
-    `Claude wants to run ${params.tool_name}: ${params.description}\n\n` +
-    `✅ = allow once. 💯 = always allow. 👎 = deny. ` +
-    `Or reply "yes ${params.request_id}" or "no ${params.request_id}".`
+  // Build the interactive card payload defensively: if it fails, still send the
+  // prose message so the user can answer with reactions / "yes <id>".
+  let uiAttachment: FileAttachment | null = null
+  try {
+    uiAttachment = await buildPermissionUiAttachment(params, state.permissionReactionIds)
+  } catch (err) {
+    log(`cv-claude-channels: failed to build permission UI attachment for ${params.request_id}: ${err}\n`)
+  }
+
+  // When the interactive card is attached, the app renders the tool, the command
+  // preview and the Allow/Deny buttons — so the message stays a short,
+  // notification-friendly line with no emoji legend (which the card would only
+  // duplicate, and which reads badly as TTS). When the card couldn't be built
+  // (e.g. no permission reactions resolved), fall back to the explicit prose
+  // carrying the request_id so the request is still answerable via reactions or
+  // a "yes <id>" reply.
+  const text = uiAttachment
+    ? `🔐 Claude Code needs your approval.`
+    : `Claude wants to run ${params.tool_name}: ${params.description}\n\n` +
+      `✅ = allow once. 💯 = always allow. 👎 = deny. ` +
+      `Or reply "yes ${params.request_id}" or "no ${params.request_id}".`
 
   try {
     const cvMessageId = await sendMessage({
       conversationId: ctx.channelId,
       threadId: ctx.replyToId,
       transcript: text,
+      attachments: uiAttachment ? [uiAttachment] : undefined,
     })
     state.pendingPermissionMessages.set(cvMessageId, {
       requestId: params.request_id,
