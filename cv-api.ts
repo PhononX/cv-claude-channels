@@ -111,6 +111,169 @@ interface AttachmentRecord {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// AGENT ↔ CLIENT INTERACTION PROTOCOL
+// See cv-api docs/plans/agent-interaction-protocol/agent-client-interaction-protocol.md
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ACP PermissionOptionKind values (agentclientprotocol.com).
+export type AcpOptionKind = 'allow_once' | 'allow_always' | 'reject_once' | 'reject_always'
+
+export interface ActionRequestOption {
+  optionId: string
+  label: string
+  kind?: AcpOptionKind
+}
+
+export interface ActionRequestRender {
+  kind: 'options' | 'form'
+  presentation?: 'permission' | 'choice'
+  options?: ActionRequestOption[]
+  minSelect?: number
+  maxSelect?: number
+  // form payloads carry a `schema` / `submitLabel`; left open for forward-compat
+  [key: string]: unknown
+}
+
+export interface ActionRequestEnvelope {
+  type: 'action_request'
+  channelId: string
+  intent: 'permission' | 'choice' | 'form'
+  title: string
+  body?: string
+  render: ActionRequestRender
+  agent?: { id: string; name: string; avatarUrl?: string }
+  runId?: string
+  blocking?: boolean
+  expiresInSeconds?: number
+  metadata?: Record<string, unknown>
+}
+
+// Client → agent response, delivered over the socket as an `action_response` event.
+export interface ActionResponsePayload {
+  requestId: string
+  outcome: 'selected' | 'submitted' | 'declined' | 'cancelled'
+  optionId?: string
+  optionIds?: string[]
+  data?: Record<string, unknown> | null
+  respondedBy?: string
+  respondedAt?: string
+}
+
+interface PendingRequest {
+  resolve: (payload: ActionResponsePayload) => void
+  reject: (err: Error) => void
+  timer: ReturnType<typeof setTimeout> | null
+}
+
+// Module-level registry correlating a posted action_request to the in-flight
+// promise that resolves when the matching action_response arrives over the
+// socket. Lives here (next to the socket) rather than in the channel module so
+// the socket listener can resolve it directly. In-memory only — lost on restart
+// (acceptable for v1; the durable record lives server-side and can be re-queried
+// via getActionRequest).
+const pendingRequests = new Map<string, PendingRequest>()
+
+/**
+ * Register an in-flight action request so the socket `action_response` listener
+ * can resolve it. Returns a function that unregisters and clears the timer; call
+ * it on settle to avoid leaks.
+ */
+export function registerPendingRequest(
+  requestId: string,
+  resolve: (payload: ActionResponsePayload) => void,
+  reject: (err: Error) => void,
+  timer: ReturnType<typeof setTimeout> | null,
+): () => void {
+  pendingRequests.set(requestId, { resolve, reject, timer })
+  return () => {
+    const entry = pendingRequests.get(requestId)
+    if (entry?.timer) clearTimeout(entry.timer)
+    pendingRequests.delete(requestId)
+  }
+}
+
+export function hasPendingRequest(requestId: string): boolean {
+  return pendingRequests.has(requestId)
+}
+
+// Resolve a pending request from an incoming action_response. Ignores unknown
+// ids (orphan / already-resolved → no-op, so a double response is harmless).
+function resolveActionResponse(payload: ActionResponsePayload): void {
+  if (!payload?.requestId) return
+  const entry = pendingRequests.get(payload.requestId)
+  if (!entry) {
+    _log(`cv-claude-channels: action_response for unknown requestId=${payload.requestId} — ignored\n`)
+    return
+  }
+  if (entry.timer) clearTimeout(entry.timer)
+  pendingRequests.delete(payload.requestId)
+  entry.resolve(payload)
+}
+
+// Exposed for tests and for the text-reply fallback path in the channel module.
+export function deliverActionResponse(payload: ActionResponsePayload): void {
+  resolveActionResponse(payload)
+}
+
+/**
+ * POST a first-class action_request to cv-api. The server persists a pending
+ * record, pushes it to the user's clients, and returns the requestId.
+ */
+export async function postActionRequest(
+  channelId: string,
+  envelope: ActionRequestEnvelope,
+): Promise<{ requestId: string }> {
+  _log(`cv-claude-channels: POST /channels/${channelId}/action-requests intent=${envelope.intent}\n`)
+  const res = await cvFetch('POST', `/channels/${channelId}/action-requests`, envelope)
+  if (!res.ok) {
+    const text = await res.text()
+    throw new Error(`CV postActionRequest failed ${res.status}: ${text}`)
+  }
+  const data = await res.json() as { requestId?: string; request_id?: string; id?: string }
+  const requestId = data.requestId ?? data.request_id ?? data.id
+  if (!requestId) throw new Error('CV postActionRequest: response missing requestId')
+  return { requestId }
+}
+
+/**
+ * GET the current state of an action_request — used for reconnect recovery, so
+ * the agent can recover an outcome that resolved while the socket was down.
+ */
+export async function getActionRequest(
+  channelId: string,
+  requestId: string,
+): Promise<ActionResponsePayload | null> {
+  const res = await cvFetch('GET', `/channels/${channelId}/action-requests/${requestId}`)
+  if (!res.ok) {
+    _log(`cv-claude-channels: GET action-request ${requestId} failed ${res.status}\n`)
+    return null
+  }
+  const data = await res.json() as {
+    requestId?: string
+    request_id?: string
+    status?: string
+    resolution?: {
+      outcome?: ActionResponsePayload['outcome']
+      optionId?: string
+      optionIds?: string[]
+      data?: Record<string, unknown> | null
+      by?: string
+      at?: string
+    } | null
+  }
+  if (!data.resolution || !data.resolution.outcome) return null
+  return {
+    requestId: data.requestId ?? data.request_id ?? requestId,
+    outcome: data.resolution.outcome,
+    optionId: data.resolution.optionId,
+    optionIds: data.resolution.optionIds,
+    data: data.resolution.data ?? null,
+    respondedBy: data.resolution.by,
+    respondedAt: data.resolution.at,
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // CORE
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -581,6 +744,14 @@ export function createConnection(
 
       socket.on('message:created', onMessageEvent)
       socket.on('message:updated', onMessageEvent)
+
+      // Agent ↔ client interaction protocol: a user's response to an
+      // action_request arrives here and resolves the matching pending promise
+      // registered by elicit(). Unknown ids are ignored (orphan / late).
+      socket.on('action_response', (payload: ActionResponsePayload) => {
+        _log(`cv-claude-channels: action_response requestId=${payload?.requestId} outcome=${payload?.outcome}\n`)
+        resolveActionResponse(payload)
+      })
 
       socket.on('connect_error', (err: Error) => {
         _log(`cv-claude-channels: Socket.IO connect error: ${err.message}\n`)

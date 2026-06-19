@@ -6,9 +6,17 @@ import {
   attachmentFromString,
   resolveActualPath,
   resolveAttachmentUrls,
+  init,
+  postActionRequest,
+  getActionRequest,
+  registerPendingRequest,
+  deliverActionResponse,
+  hasPendingRequest,
   type CVAttachment,
   type FileAttachment,
   type LinkAttachment,
+  type ActionRequestEnvelope,
+  type ActionResponsePayload,
 } from './cv-api.ts'
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -229,5 +237,152 @@ describe('resolveAttachmentUrls', () => {
   it('throws when the bulk signed-URL API returns a non-ok response', async () => {
     mockFetch.mockResolvedValueOnce({ ok: false, status: 403 })
     await expect(resolveAttachmentUrls([att()])).rejects.toThrow('403')
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Agent ↔ Client Interaction Protocol transport
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('postActionRequest', () => {
+  const mockFetch = vi.fn()
+
+  beforeEach(() => {
+    vi.stubGlobal('fetch', mockFetch)
+    init({ pat: 'test-pat', log: () => {} })
+  })
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+    mockFetch.mockReset()
+  })
+
+  function envelope(overrides: Partial<ActionRequestEnvelope> = {}): ActionRequestEnvelope {
+    return {
+      type: 'action_request',
+      channelId: 'chan_1',
+      intent: 'permission',
+      title: 'Claude wants to run Bash',
+      render: {
+        kind: 'options',
+        presentation: 'permission',
+        options: [{ optionId: 'allow_once', label: 'Allow once', kind: 'allow_once' }],
+      },
+      ...overrides,
+    }
+  }
+
+  it('POSTs to the channel action-requests endpoint with a Bearer PAT and JSON body', async () => {
+    mockFetch.mockResolvedValueOnce({ ok: true, json: async () => ({ requestId: 'areq_1' }) })
+
+    const result = await postActionRequest('chan_1', envelope())
+
+    expect(result).toEqual({ requestId: 'areq_1' })
+    const [url, init] = mockFetch.mock.calls[0]
+    expect(url).toBe('https://api.carbonvoice.app/channels/chan_1/action-requests')
+    expect(init.method).toBe('POST')
+    expect(init.headers.Authorization).toBe('Bearer test-pat')
+    expect(init.headers['Content-Type']).toBe('application/json')
+    const body = JSON.parse(init.body)
+    expect(body.intent).toBe('permission')
+    expect(body.render.options[0].kind).toBe('allow_once')
+  })
+
+  it('accepts request_id / id aliases for the returned requestId', async () => {
+    mockFetch.mockResolvedValueOnce({ ok: true, json: async () => ({ request_id: 'areq_alias' }) })
+    expect(await postActionRequest('chan_1', envelope())).toEqual({ requestId: 'areq_alias' })
+  })
+
+  it('throws when the server returns a non-ok response', async () => {
+    mockFetch.mockResolvedValueOnce({ ok: false, status: 500, text: async () => 'boom' })
+    await expect(postActionRequest('chan_1', envelope())).rejects.toThrow('500')
+  })
+
+  it('throws when the response is missing a requestId', async () => {
+    mockFetch.mockResolvedValueOnce({ ok: true, json: async () => ({}) })
+    await expect(postActionRequest('chan_1', envelope())).rejects.toThrow('missing requestId')
+  })
+})
+
+describe('pending request registry (socket action_response)', () => {
+  beforeEach(() => {
+    init({ pat: 'test-pat', log: () => {} })
+  })
+
+  it('resolves the matching pending promise when an action_response is delivered', () => {
+    const resolved: ActionResponsePayload[] = []
+    registerPendingRequest('areq_1', (p) => resolved.push(p), () => {}, null)
+
+    expect(hasPendingRequest('areq_1')).toBe(true)
+    deliverActionResponse({ requestId: 'areq_1', outcome: 'selected', optionId: 'allow_once' })
+
+    expect(resolved).toHaveLength(1)
+    expect(resolved[0].optionId).toBe('allow_once')
+    expect(hasPendingRequest('areq_1')).toBe(false)
+  })
+
+  it('ignores an action_response whose requestId does not match any pending request', () => {
+    const resolved: ActionResponsePayload[] = []
+    registerPendingRequest('areq_keep', (p) => resolved.push(p), () => {}, null)
+
+    deliverActionResponse({ requestId: 'areq_other', outcome: 'declined' })
+
+    expect(resolved).toHaveLength(0)
+    expect(hasPendingRequest('areq_keep')).toBe(true)
+  })
+
+  it('clears the timer and unregisters when the unregister fn is called', () => {
+    const timer = setTimeout(() => {}, 60_000)
+    const unregister = registerPendingRequest('areq_timer', () => {}, () => {}, timer)
+    expect(hasPendingRequest('areq_timer')).toBe(true)
+    unregister()
+    expect(hasPendingRequest('areq_timer')).toBe(false)
+  })
+
+  it('only delivers once — a second action_response for the same id is a no-op', () => {
+    let count = 0
+    registerPendingRequest('areq_once', () => { count++ }, () => {}, null)
+    deliverActionResponse({ requestId: 'areq_once', outcome: 'selected', optionId: 'allow_once' })
+    deliverActionResponse({ requestId: 'areq_once', outcome: 'declined' })
+    expect(count).toBe(1)
+  })
+})
+
+describe('getActionRequest', () => {
+  const mockFetch = vi.fn()
+
+  beforeEach(() => {
+    vi.stubGlobal('fetch', mockFetch)
+    init({ pat: 'test-pat', log: () => {} })
+  })
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+    mockFetch.mockReset()
+  })
+
+  it('GETs the action-request and returns the resolution outcome', async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        requestId: 'areq_1',
+        status: 'resolved',
+        resolution: { outcome: 'selected', optionId: 'allow_always', by: 'user_9', at: '2026-06-18T00:00:00Z' },
+      }),
+    })
+
+    const result = await getActionRequest('chan_1', 'areq_1')
+    expect(mockFetch.mock.calls[0][0]).toBe('https://api.carbonvoice.app/channels/chan_1/action-requests/areq_1')
+    expect(result).toMatchObject({ requestId: 'areq_1', outcome: 'selected', optionId: 'allow_always', respondedBy: 'user_9' })
+  })
+
+  it('returns null when the request is still pending (no resolution)', async () => {
+    mockFetch.mockResolvedValueOnce({ ok: true, json: async () => ({ status: 'pending', resolution: null }) })
+    expect(await getActionRequest('chan_1', 'areq_1')).toBeNull()
+  })
+
+  it('returns null on a non-ok response', async () => {
+    mockFetch.mockResolvedValueOnce({ ok: false, status: 404 })
+    expect(await getActionRequest('chan_1', 'areq_1')).toBeNull()
   })
 })
