@@ -84,6 +84,8 @@ npm start
 - `CV_POLL_INTERVAL_MS` - Polling interval in milliseconds (default: 5 seconds)
 - `CV_WS_RETRY_MAX_MS` - Max WebSocket retry backoff in milliseconds (default: 30 seconds)
 - `CV_STATE_PATH` - Path to state file (default: `~/.claude/channels/cv/state.json`)
+- `CV_PROTOCOL_MODE` - Permission relay mode: `legacy` (default) or `protocol`. `legacy` keeps the prose + reaction-polling flow for older Carbon Voice clients. `protocol` posts a first-class `action_request` and awaits the correlated `action_response` over the socket (the Agent ↔ Client Interaction Protocol). Flip to `protocol` once the Carbon Voice client ships protocol support.
+- `CV_PERMISSION_TIMEOUT_MS` - In `protocol` mode, how long to wait for a permission response before the request is treated as `cancelled` (denied). Default: 5 minutes.
 
 ## Usage
 

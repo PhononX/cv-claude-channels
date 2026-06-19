@@ -44,10 +44,12 @@ import {
   sendMessage, getRecentMessages, getShareLink, attachmentFromString,
   downloadAttachmentsToDir, downloadShareLinkAttachmentsToDir,
   createConnection,
+  deliverActionResponse, hasPendingRequest,
   type CVConnection,
   type CVMessageEvent,
   type CVAttachment,
 } from './cv-api.js'
+import { resolvePermission } from './elicit.js'
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CONFIG
@@ -71,6 +73,12 @@ const ATTACHMENTS_DIR      = process.env.CV_ATTACHMENTS_DIR
   ?? path.join(os.homedir(), '.claude', 'channels', 'cv', 'attachments')
 const PROJECT_NAME         = process.env.CV_PROJECT_NAME ?? 'this project'
 const LOG_FILE             = process.env.CV_LOG_FILE ?? ''
+// Rollout flag for the Agent ↔ Client Interaction Protocol.
+//   'legacy'   — today's behavior: prose + reaction polling (default; keeps older clients working).
+//   'protocol' — post a first-class action_request and await the action_response via elicit().
+// Flip to 'protocol' once the Flutter client ships (master plan Appendix A).
+const PROTOCOL_MODE        = (process.env.CV_PROTOCOL_MODE ?? 'legacy') === 'protocol' ? 'protocol' : 'legacy'
+const PERMISSION_TIMEOUT_MS = Number(process.env.CV_PERMISSION_TIMEOUT_MS ?? 300_000)
 
 const timestamp = () => new Date().toISOString().replace('T', ' ').replace('Z', '')
 const log = LOG_FILE
@@ -471,27 +479,82 @@ mcp.setNotificationHandler(PermissionRequestSchema, async ({ params }) => {
     return
   }
 
+  if (PROTOCOL_MODE === 'protocol') {
+    await relayPermissionViaProtocol(params, ctx)
+    return
+  }
+
+  relayPermissionViaLegacy(params, ctx)
+})
+
+// Legacy path: prose message + reaction polling. Kept behind CV_PROTOCOL_MODE so
+// older Flutter clients that don't understand action_request keep working.
+function relayPermissionViaLegacy(
+  params: { request_id: string; tool_name: string; description: string },
+  ctx: { channelId: string; replyToId: string },
+): void {
   const text =
     `Claude wants to run ${params.tool_name}: ${params.description}\n\n` +
     `✅ = allow once. 💯 = always allow. 👎 = deny. ` +
     `Or reply "yes ${params.request_id}" or "no ${params.request_id}".`
 
-  try {
-    const cvMessageId = await sendMessage({
-      conversationId: ctx.channelId,
-      threadId: ctx.replyToId,
-      transcript: text,
-    })
+  sendMessage({
+    conversationId: ctx.channelId,
+    threadId: ctx.replyToId,
+    transcript: text,
+  }).then(cvMessageId => {
     state.pendingPermissionMessages.set(cvMessageId, {
       requestId: params.request_id,
       channelId: ctx.channelId,
       toolName: params.tool_name,
     })
     log(`cv-claude-channels: permission request for ${params.tool_name} relayed to CV (request_id=${params.request_id} cvMessageId=${cvMessageId})\n`)
-  } catch (err) {
+  }).catch(err => {
     log(`cv-claude-channels: permission relay send failed for ${params.request_id}: ${err}\n`)
+  })
+}
+
+// Protocol path: post a first-class action_request, await the correlated
+// action_response over the socket, then notify Claude Code with the mapped
+// behavior. Reads linearly — no reaction polling.
+async function relayPermissionViaProtocol(
+  params: { request_id: string; tool_name: string; description: string },
+  ctx: { channelId: string; replyToId: string },
+): Promise<void> {
+  try {
+    log(`cv-claude-channels: eliciting permission for ${params.tool_name} (request_id=${params.request_id})\n`)
+    const { behavior, allowAlways, outcome } = await resolvePermission({
+      channelId: ctx.channelId,
+      requestId: params.request_id,
+      toolName: params.tool_name,
+      description: params.description,
+      replyToId: ctx.replyToId,
+      timeoutMs: PERMISSION_TIMEOUT_MS,
+    })
+
+    if (allowAlways) {
+      state.allowAlwaysTools.add(params.tool_name)
+      log(`cv-claude-channels: ${params.tool_name} added to session allow_always list\n`)
+    }
+
+    log(`cv-claude-channels: permission outcome=${outcome.outcome} optionId=${outcome.optionId ?? '-'} → behavior=${behavior} (request_id=${params.request_id})\n`)
+    await mcp.notification({
+      method: 'notifications/claude/channel/permission',
+      params: { request_id: params.request_id, behavior },
+    })
+  } catch (err) {
+    log(`cv-claude-channels: protocol permission relay failed for ${params.request_id}: ${err}\n`)
+    // Fail closed: deny so Claude Code degrades gracefully rather than hanging.
+    try {
+      await mcp.notification({
+        method: 'notifications/claude/channel/permission',
+        params: { request_id: params.request_id, behavior: 'deny' },
+      })
+    } catch (notifyErr) {
+      log(`cv-claude-channels: deny-on-error notification failed for ${params.request_id}: ${notifyErr}\n`)
+    }
   }
-})
+}
 
 
 async function loadAccess() {
@@ -860,6 +923,20 @@ async function processMessage(event: CVMessageEvent): Promise<boolean | null> {
     const requestId = permMatch[2].toLowerCase()
     log(`cv-claude-channels: permission verdict ${verdict} for request ${requestId}\n`)
 
+    // Protocol mode: if elicit() is awaiting this request, route the text reply
+    // into the same registry so power users can still type "yes <id>". The
+    // awaiting elicit() promise then notifies Claude Code with the mapped behavior.
+    if (PROTOCOL_MODE === 'protocol' && hasPendingRequest(requestId)) {
+      deliverActionResponse({
+        requestId,
+        outcome: 'selected',
+        optionId: verdict === 'allow' ? 'allow_once' : 'reject_once',
+      })
+      await markProcessed(event)
+      await markRead(channel_id, event.message_id)
+      return true
+    }
+
     try {
       await mcp.notification({
         method: 'notifications/claude/channel/permission',
@@ -1223,7 +1300,11 @@ async function fetchMissedMessagesOnce() {
     )
   }
 
-  await checkPendingPermissions(allMessages)
+  // Reaction-polling permission resolution is the legacy path only. In protocol
+  // mode the outcome arrives over the socket via elicit(), so skip the scan.
+  if (PROTOCOL_MODE !== 'protocol') {
+    await checkPendingPermissions(allMessages)
+  }
   await checkPendingAttachments(messages)
 
   // Advance cursor as far as possible:
