@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "carbon-voice": {
+      "command": "node",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/dist/cv-claude-channel.js"]
+    }
+  }
+}

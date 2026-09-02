@@ -9,7 +9,7 @@ import {
   type CVAttachment,
   type FileAttachment,
   type LinkAttachment,
-} from './cv-api.ts'
+} from './cv-api.js'
 
 // ─────────────────────────────────────────────────────────────────────────────
 // attachmentFromString

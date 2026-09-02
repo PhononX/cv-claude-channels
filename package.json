@@ -1,6 +1,6 @@
 {
   "name": "@carbonvoice/cv-claude-channel",
-  "version": "0.1.8",
+  "version": "0.2.0",
   "description": "Carbon Voice Claude Channel server - bridges Carbon Voice conversations into Claude Code sessions",
   "type": "module",
   "main": "./dist/cv-claude-channel.js",
@@ -33,7 +33,7 @@
   },
   "homepage": "https://github.com/PhononX/cv-claude-channel#readme",
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.0.0",
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "socket.io-client": "^4.0.0",
     "zod": "^3.0.0"
   },
@@ -45,5 +45,13 @@
   },
   "engines": {
     "node": ">=18.0.0"
-  }
+  },
+  "files": [
+    "dist",
+    ".claude-plugin/plugin.json",
+    ".mcp.json",
+    "skills",
+    "README.md",
+    "LICENSE.txt"
+  ]
 }

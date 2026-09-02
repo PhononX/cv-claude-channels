@@ -2,25 +2,57 @@
 
 [![npm version](https://badge.fury.io/js/@carbonvoice%2fcv-claude-channel.svg)](https://www.npmjs.com/package/@carbonvoice/cv-claude-channel)
 
-A Claude Code channel server that bridges Carbon Voice conversations into Claude Code sessions. Receive real-time voice messages and reply back with text-to-speech.
+A Claude Code channel that bridges Carbon Voice conversations into a running Claude Code session. Send a voice message, Claude does the work on your machine, and the reply comes back as audio.
 
-If computer is offline, messages will be queued and delivered when connection is restored.
+If your computer is offline, messages queue and are delivered when the connection is restored.
 
 ## Features
 
 - **Real-time message delivery** via WebSocket (primary) with polling fallback
-- **Two-way communication** - Claude can reply back into Carbon Voice conversations
-- **Sender gating** - Restrict which users can send messages (optional)
-- **Permission relay** - Forward tool approval prompts to Carbon Voice for remote approval
-- **Deduplication** - Automatic message deduplication with TTL
-- **State persistence** - Resumes from last seen timestamp after restart
-- **Reaction support** - Auto-acknowledge messages with configurable reactions
+- **Two-way communication** — Claude replies back into Carbon Voice conversations
+- **Sender gating** — deny-by-default allowlist, managed from the terminal only
+- **Permission relay** — approve or deny `Bash`/`Write`/`Edit` prompts from your phone
+- **Attachments** — files sent in Carbon Voice are downloaded for Claude to read
+- **Deduplication** and **state persistence** — resumes from the last-seen cursor
 
-## Installation
+## Install
 
-### Option 1: Using npx (recommended)
+```
+/plugin marketplace add PhononX/cv-claude-channel
+/plugin install carbon-voice@carbonvoice
+/carbon-voice:configure <your-personal-access-token>
+```
 
-Add to your project's `.mcp.json`:
+Then restart Claude Code with the channel enabled — see the table below for which flag applies to you.
+
+### Who can run it, and how
+
+Channels are in research preview, and which flag you need depends on your plan:
+
+| You are | Command | Prerequisites |
+| --- | --- | --- |
+| Pro/Max, no organization | `claude --dangerously-load-development-channels plugin:carbon-voice@carbonvoice` | none |
+| Team/Enterprise | `claude --channels plugin:carbon-voice@carbonvoice` | admin sets **both** `channelsEnabled` and `allowedChannelPlugins` |
+
+Two things worth knowing before you file a bug:
+
+- **`channelsEnabled` is off by default on Team and Enterprise plans**, and it blocks the development flag too. If you are in an organization and see "blocked by org policy" at startup, no flag will get you around it — an admin has to enable channels first.
+- This plugin is not on Anthropic's curated channel allowlist, so `--channels` alone will not load it outside an organization that has allowlisted it. That is expected, not a misconfiguration.
+
+For an admin, the managed-settings entry is:
+
+```json
+{
+  "channelsEnabled": true,
+  "allowedChannelPlugins": [
+    { "marketplace": "carbonvoice", "plugin": "carbon-voice" }
+  ]
+}
+```
+
+### Without the plugin
+
+The bare MCP server still works and is supported for one more release. Add it to `.mcp.json`:
 
 ```json
 {
@@ -28,143 +60,120 @@ Add to your project's `.mcp.json`:
     "cv-claude-channel": {
       "command": "npx",
       "args": ["@carbonvoice/cv-claude-channel"],
-      "env": {
-        "CV_PAT": "your-personal-access-token"
-      }
+      "env": { "CV_PAT": "your-personal-access-token" }
     }
   }
 }
 ```
 
-### Option 2: Local installation
-
-Install globally:
-
-```bash
-npm install -g @carbonvoice/cv-claude-channel
-```
-
-Then configure `.mcp.json`:
-
-```json
-{
-  "mcpServers": {
-    "cv-claude-channel": {
-      "command": "cv-claude-channel",
-      "env": {
-        "CV_PAT": "your-personal-access-token"
-      }
-    }
-  }
-}
-```
-
-### Option 3: Development setup
-
-Clone and run locally:
-
-```bash
-git clone https://github.com/PhononX/cv-claude-channel
-cd cv-claude-channel
-npm install
-npm start
-```
+and start with `claude --dangerously-load-development-channels server:cv-claude-channel`. New installs should prefer the plugin — `/carbon-voice:configure` keeps your token out of `.mcp.json`, which usually gets committed.
 
 ## Configuration
 
-### Required Environment Variables
+The Personal Access Token is the only required setting. `/carbon-voice:configure` writes it to `~/.claude/channels/cv/.env` (mode 0600); an explicit `CV_PAT` in the environment takes precedence.
 
-- `CV_PAT` - Your Carbon Voice Personal Access Token
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `CV_PAT` | — | Personal Access Token. Required unless set via `/carbon-voice:configure`. |
+| `CV_ENV_PATH` | `~/.claude/channels/cv/.env` | Where the token file lives |
+| `CV_CONVERSATION_ID` | all | Scope to a single conversation |
+| `CV_PROJECT_NAME` | `this project` | Project name shown to a newly allowed sender |
+| `CV_ACCESS_PATH` | `~/.claude/channels/cv/access.json` | Allowlist file |
+| `CV_STATE_PATH` | `~/.claude/channels/cv/state.json` | Cursor file |
+| `CV_ATTACHMENTS_DIR` | `~/.claude/channels/cv/attachments` | Downloaded attachments |
+| `CV_POLL_INTERVAL_MS` | `5000` | Polling interval when WebSocket is down |
+| `CV_WS_RETRY_MAX_MS` | `30000` | Max WebSocket retry backoff |
+| `CV_ATTACHMENT_TIMEOUT_MS` | `600000` | How long to wait for a pending upload |
+| `CV_ATTACHMENT_NUDGE_MS` | `120000` | When to nudge about a slow upload |
+| `CV_OWN_USER_ID` | resolved via API | Skip the identity lookup at startup |
+| `CV_PERMISSION_TTL_MS` | `600000` | How long a relayed approval prompt stays answerable |
+| `CV_PERMISSION_CONTEXT_TTL_MS` | `600000` | How stale the target conversation may be before a prompt is not relayed |
+| `CV_PERMISSION_PREVIEW_MAX` | `400` | Characters of tool input shown in a relayed prompt |
+| `CV_REACTION_ID` | `acknowledged` | Reaction used as the processed marker |
+| `CV_PERMISSION_ALLOW_REACTION` | `acknowledged` | Reaction meaning "allow once" |
+| `CV_PERMISSION_ALLOW_ALWAYS_REACTION` | `affirmative` | Reaction meaning "allow for this session" |
+| `CV_PERMISSION_DENY_REACTION` | `negative` | Reaction meaning "deny" |
+| `CV_LOG_FILE` | stderr only | Mirror the log to a file |
 
-### Optional Environment Variables
-
-- `CV_CONVERSATION_ID` - Scope to a specific conversation (omit to receive all)
-- `CV_REACTION_ID` - Specific reaction ID to add on message receipt
-- `CV_SEEN_TTL_MS` - Deduplication TTL in milliseconds (default: 5 minutes)
-- `CV_POLL_INTERVAL_MS` - Polling interval in milliseconds (default: 5 seconds)
-- `CV_WS_RETRY_MAX_MS` - Max WebSocket retry backoff in milliseconds (default: 30 seconds)
-- `CV_STATE_PATH` - Path to state file (default: `~/.claude/channels/cv/state.json`)
+> The processed marker and the "allow once" reaction default to the same reaction. They are only ever compared against different messages, and the server ignores its own reactions, but setting them to distinct reactions is clearer — the server logs a warning at startup if they collide.
 
 ## Usage
 
-Start Claude Code with the channel enabled:
-
-```bash
-claude --dangerously-load-development-channels server:cv-claude-channel
-```
-
-### Receiving Messages
-
-When a message arrives in Carbon Voice, it appears in Claude Code as:
+### Receiving messages
 
 ```
-<channel source="carbon-voice" channel_id="..." message_id="..." sender_id="..." is_reply="false" reply_to_id="...">
+<channel source="plugin:carbon-voice:carbon-voice" channel_id="..." message_id="..." sender_id="..." is_reply="false" reply_to_id="...">
   transcript of what was said
 </channel>
 ```
 
 ### Replying
 
-Ask Claude to reply, and it will call the `send_message` tool with:
-- `channel_id` - The conversation to send into
-- `reply_to_message_id` - The message to thread under
-- `text` - Claude's response (converted to audio automatically)
+Claude calls `send_message` with `channel_id`, `reply_to_message_id`, and `text`. Carbon Voice converts the text to audio.
 
-### Permission Prompts
+### Permission prompts
 
-When Claude needs approval for dangerous tools (Bash, Write, Edit), you'll receive a prompt in Carbon Voice:
+When Claude needs approval for a tool, the prompt is relayed to Carbon Voice:
 
 ```
-Claude wants to run Bash: <description>
+Claude wants to run Bash: Delete the build directory
 
-Reply "yes abcde" or "no abcde" to grant or deny permission.
+{"command":"rm -rf ./build"}
+
+✅ = allow once. 💯 = allow Bash for the rest of this session, whatever the arguments. 👎 = deny.
+Or reply "yes abcde" or "no abcde".
 ```
 
-Reply with `yes <request_id>` or `no <request_id>` to approve or deny.
+React, or reply `yes <id>` / `no <id>`. The local terminal dialog stays open the whole time — whichever answer arrives first wins.
+
+The prompt shows the tool's actual arguments, not just Claude's description, because for `Bash` the description is often the bare string `Run shell command`. Long values are truncated for playback, and Claude Code masks recognizable credentials as `[REDACTED]` before the server ever sees them. Note that masking can hide key *names* as well as values, so a displayed key may not match the real input.
+
+A relayed prompt expires after `CV_PERMISSION_TTL_MS` and can no longer be answered from Carbon Voice; the terminal dialog is unaffected.
 
 ## Security
 
-### Sender Gating
+### Sender gating
 
-All senders are denied by default. Use the `allow_sender` and `block_sender` tools at runtime to manage access. The allowlist is persisted to disk and survives server restarts. Unauthorized messages are dropped silently (no feedback to sender) to prevent prompt injection.
+**Every sender is denied by default.** Unauthorized messages are dropped silently.
 
-If the allowlist is completely empty and someone messages in, they'll receive a reply in Carbon Voice: *"Allow Sender list is currently empty. Go to Claude to approve senders."*
-
-**Adding a sender**
-
-When an unknown user tries to send a message, Claude receives a notification:
+Access is managed from the terminal with `/carbon-voice:access`:
 
 ```
-Unknown sender attempting to message through Carbon Voice.
-Sender ID: <user-id>
-
-To add them to the allowlist, call the allow_sender tool with this user ID.
+/carbon-voice:access list
+/carbon-voice:access allow <user-id>
+/carbon-voice:access remove <user-id>
+/carbon-voice:access block <user-id>
+/carbon-voice:access unblock <user-id>
 ```
 
-Ask Claude to allow them:
+Allowlist changes are **only** made this way. The channel server reads
+`access.json` and never writes it, and it exposes no tool that can widen access
+— so no inbound message, forwarded message, or attachment can talk Claude into
+allowlisting anyone. The skill itself refuses requests that arrived over the
+channel. Edits take effect on the next inbound message, without a restart.
 
-> Allow sender \<user-id\>
+When an unknown sender messages, Claude is told once per session so it can pass the ID along to you. Acting on it is your call, at the terminal.
 
-Claude will call `allow_sender` with that user ID. Their messages will be forwarded immediately and on all future sessions.
+If the allowlist is completely empty, the sender gets one reply in Carbon Voice: *"Allow Sender list is currently empty. Go to Claude to approve senders."*
 
-**Blocking a sender**
+### What allowing someone grants
 
-Ask Claude to block them:
-
-> Block sender \<user-id\>
-
-Claude will call `block_sender`. That user will be permanently silenced, even if they were previously allowed.
-
-### Permission Relay
-
-Permission relay is enabled by default. When Claude requires tool approval, the prompt is forwarded to Carbon Voice for remote approval. This allows you to approve dangerous operations from anywhere.
+An allowlisted sender can send messages Claude acts on **and** can approve or deny relayed tool-use prompts, including `Bash`, `Write`, and `Edit`. Only allow people you would trust with that. This is why the allowlist is deliberately awkward to change.
 
 ## Development
 
-### Building
+```bash
+npm install
+npm start          # run against the TypeScript source
+npm run build      # compile to dist/
+npm test           # vitest
+```
+
+Test the plugin without publishing:
 
 ```bash
-npm run build
+claude --plugin-dir . --dangerously-load-development-channels plugin:carbon-voice
+claude plugin validate . --strict
 ```
 
 ### Publishing
@@ -173,19 +182,17 @@ npm run build
 npm publish
 ```
 
-## Architecture
-
-- **WebSocket mode** (primary): Real-time message delivery via Socket.IO
-- **Polling mode** (fallback): Polls `/v3/messages/recent` endpoint
-- **Auto-reconnect**: Automatically switches between modes with backoff
-- **State persistence**: Saves cursor to disk for resumption after restart
-- **Deduplication**: In-memory cache with configurable TTL
+`prepublishOnly` runs the build. The published tarball is an installable plugin as well as an MCP server — the `.claude-plugin/`, `.mcp.json`, and `skills/` entries are what the marketplace `npm` source resolves.
 
 ## Requirements
 
-- Node.js >= 18.0.0
-- Carbon Voice account with Personal Access Token
-- Claude Code with MCP support
+- Node.js >= 18
+- A Carbon Voice account with a Personal Access Token
+- Claude Code with channels available on your plan (see the table above)
+
+### Known incompatibility
+
+Claude Code does not register a channel server that negotiates MCP protocol revision `2026-07-28`. No published `@modelcontextprotocol/sdk` speaks that revision yet, and it is only reachable if you set `MCP_PROTOCOL_NEGOTIATION=auto`. If a future SDK adds it and the channel stops registering, leave that variable unset or set it to `legacy`.
 
 ## License
 

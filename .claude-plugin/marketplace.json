@@ -1,0 +1,27 @@
+{
+  "name": "carbonvoice",
+  "owner": {
+    "name": "PhononX",
+    "url": "https://github.com/PhononX"
+  },
+  "plugins": [
+    {
+      "name": "carbon-voice",
+      "source": {
+        "source": "npm",
+        "package": "@carbonvoice/cv-claude-channel"
+      },
+      "description": "Carbon Voice channel for Claude Code — send voice messages into a running session and get spoken replies back, with remote tool-approval relay.",
+      "version": "0.2.0",
+      "displayName": "Carbon Voice",
+      "author": {
+        "name": "PhononX"
+      },
+      "homepage": "https://github.com/PhononX/cv-claude-channel#readme",
+      "repository": "https://github.com/PhononX/cv-claude-channel",
+      "license": "MIT",
+      "category": "messaging",
+      "keywords": ["carbon-voice", "voice", "audio", "messaging", "channel", "mcp"]
+    }
+  ]
+}
