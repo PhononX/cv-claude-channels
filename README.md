@@ -217,7 +217,8 @@ npm run smoke      # protocol smoke test (needs a build first; hits no network)
 Test the plugin without publishing:
 
 ```bash
-claude --plugin-dir . --dangerously-load-development-channels plugin:carbon-voice
+npm run build
+claude --plugin-dir . --dangerously-load-development-channels plugin:carbon-voice@inline
 claude plugin validate . --strict
 ```
 

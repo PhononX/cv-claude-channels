@@ -52,8 +52,18 @@ npm run test:watch     # watch mode
 Test the plugin without publishing:
 
 ```bash
-claude --plugin-dir . --dangerously-load-development-channels plugin:carbon-voice
+npm run build   # the plugin's .mcp.json runs dist/, so build first
+claude --plugin-dir . --dangerously-load-development-channels plugin:carbon-voice@inline
 claude plugin validate . --strict
+```
+
+**The marketplace id is `@inline`, not `@carbonvoice`, when loading from a
+directory.** `carbonvoice` resolves the npm package, which only works once
+published; `--plugin-dir` registers the plugin under the synthetic `inline`
+marketplace. Confirm with:
+
+```bash
+claude --plugin-dir . plugin list --json   # -> "id": "carbon-voice@inline"
 ```
 
 ### Environment Variables
