@@ -11,7 +11,7 @@ Published as `@carbonvoice/cv-claude-channel` on npm, and installable as the `ca
 ### Message Flow
 1. **Inbound**: Messages arrive from Carbon Voice via WebSocket (primary) or polling (fallback).
 2. **Deduplication**: Server-side reaction marker plus an in-memory cursor prevent duplicate processing.
-3. **Sender gating**: Deny-by-default allowlist. Unknown senders trigger a one-shot notification telling the *operator* to run `/carbon-voice:access`.
+3. **Sender gating**: Deny-by-default allowlist. Under `dmPolicy: "pairing"` an unknown sender is replied to in CV with a 6-character code and the operator runs `/carbon-voice:access pair <code>`; under `"allowlist"` they are dropped silently. Either way Claude is notified once per sender, and only the *operator* can act.
 4. **Claude receives**: As a `<channel>` tag with `channel_id`, `sender_id`, `message_id`, `reply_to_id`. The `source` attribute is set by Claude Code from the server name — do not set `source` in `meta`.
 5. **Claude replies**: Calls `send_message` with channel_id, reply_to_message_id, and text. CV auto-converts to audio.
 
@@ -26,8 +26,13 @@ Only `allow` and `deny` exist on the wire. "Allow always" is ours: it adds the t
 
 ### State Persistence
 - **Cursor**: Last-checked timestamp on disk (`~/.claude/channels/cv/state.json`), debounced 5s.
-- **Allowlist**: `~/.claude/channels/cv/access.json`. **Read-only to this server** — see below.
-- **Token**: `~/.claude/channels/cv/.env`, written by `/carbon-voice:configure`.
+- **Allowlist**: `<config>/channels/cv/access.json`. **Read-only to this server** — see below.
+- **Pairing codes**: `<config>/channels/cv/pending.json`. **Server-owned**, read by the skill.
+- **Token**: `<config>/channels/cv/.env`, written by `/carbon-voice:configure`.
+
+`<config>` is `CLAUDE_CONFIG_DIR` if set, else `~/.claude`. Server and skills
+resolve it identically; individual files can be overridden with `CV_ACCESS_PATH`,
+`CV_PENDING_PATH`, `CV_STATE_PATH`, `CV_ENV_PATH`, `CV_ATTACHMENTS_DIR`.
 - **Pending permissions**: In-memory, with a TTL sweep.
 
 ## Security Model
@@ -36,6 +41,16 @@ Two invariants worth not breaking:
 
 1. **The server never writes the allowlist.** There is no MCP tool that can add a sender. Only `/carbon-voice:access` (a user-invocable skill that refuses channel-originated requests) writes `access.json`; the server reloads it on mtime change. This exists because inbound transcripts, forwarded messages, and attachment contents all reach Claude unfenced — if a tool could widen access, one crafted message could escalate. And allowlist membership is what authorizes permission approval.
 2. **The server ignores its own reactions** when resolving permission verdicts, so its processed-marker reaction can never read as an approval.
+
+3. **Pairing codes are a request, not a grant.** The server writes `pending.json`
+   but never `access.json`, so issuing a code cannot widen access — only the
+   operator typing `pair <code>` does. This split is why pairing does not
+   weaken invariant 1.
+
+`dmPolicy` migration: a fresh install (no `access.json`) defaults to `pairing`
+so the first sender can be captured. An **existing** file with no `dmPolicy`
+migrates to `allowlist` — upgrading must never open a door the operator did not
+ask for.
 
 If you add a tool, ask whether an inbound message could talk Claude into calling it.
 
@@ -49,22 +64,45 @@ npm test               # vitest
 npm run test:watch     # watch mode
 ```
 
-Test the plugin without publishing:
+### The reliable dev loop: the bare server
 
-```bash
-npm run build   # the plugin's .mcp.json runs dist/, so build first
-claude --plugin-dir . --dangerously-load-development-channels plugin:carbon-voice@inline
-claude plugin validate . --strict
+Put the entry in **user-level `~/.claude.json`** with an absolute path (not the
+project `.mcp.json`, which is now the plugin's own file):
+
+```json
+{ "mcpServers": { "cv-claude-channel": {
+  "command": "npx",
+  "args": ["tsx", "/abs/path/to/cv-claude-channels/cv-claude-channel.ts"],
+  "env": { "CV_PAT": "..." }
+} } }
 ```
 
-**The marketplace id is `@inline`, not `@carbonvoice`, when loading from a
-directory.** `carbonvoice` resolves the npm package, which only works once
-published; `--plugin-dir` registers the plugin under the synthetic `inline`
-marketplace. Confirm with:
+```bash
+claude --dangerously-load-development-channels server:cv-claude-channel
+```
+
+No build, no marketplace, and it exercises every server behavior.
+
+### Loading the plugin itself — unresolved
 
 ```bash
-claude --plugin-dir . plugin list --json   # -> "id": "carbon-voice@inline"
+npm run build                      # the plugin's .mcp.json runs dist/
+claude plugin validate . --strict  # this works
 ```
+
+`claude --plugin-dir . plugin list --json` reports the id as
+`carbon-voice@inline`, but passing `plugin:carbon-voice@inline` to
+`--dangerously-load-development-channels` was **reported failing** with "plugin
+not installed", and `@carbonvoice` only resolves once the npm package is
+published. The dev flag may not accept a session-scoped plugin from the
+synthetic `inline` marketplace at all. Until this is settled, use the bare
+server above.
+
+Related unresolved packaging problem: `dist/` is gitignored, so a **git**-sourced
+plugin has no compiled output for `.mcp.json` to run, while the **npm** source
+has `dist/` but may arrive without `node_modules`. Neither source type is
+verified end-to-end yet. Options if it needs solving: commit `dist/`, or have
+`.mcp.json` run the TypeScript source via `tsx`.
 
 ### Environment Variables
 
@@ -83,7 +121,7 @@ claude --plugin-dir . plugin list --json   # -> "id": "carbon-voice@inline"
 - **cv-api.ts** / **cv-api.test.ts**: CV API client wrapper.
 - **.claude-plugin/plugin.json**: plugin manifest.
 - **.claude-plugin/marketplace.json**: marketplace catalog; points at the npm package.
-- **.mcp.json**: plugin-supplied server config. **Committed** — `--plugin-dir .` and `claude plugin validate` both need it, and the npm tarball is the plugin. Because the plugin root is also the repo root, opening this repo in Claude Code will offer it as a *project* MCP server, where `${CLAUDE_PLUGIN_ROOT}` doesn't expand and the entry fails. Decline it; use `--plugin-dir .` to test the real thing. Put local experiments in `.mcp.json.local`, which is gitignored. **Upgrading from before 0.2.0: back up your local `.mcp.json` first.** It used to be gitignored, and git silently overwrites an ignored file when a commit starts tracking it — pulling will destroy your dev config with no warning or conflict.
+- **.mcp.json**: plugin-supplied server config. **Committed** — `--plugin-dir .` and `claude plugin validate` both need it, and the npm tarball is the plugin. Because the plugin root is also the repo root, opening this repo in Claude Code will offer it as a *project* MCP server, where `${CLAUDE_PLUGIN_ROOT}` doesn't expand and the entry fails. Decline it; use `--plugin-dir .` to test the real thing. Claude Code does **not** read `.mcp.json.local` — for a bare-server dev loop put the entry in user-level `~/.claude.json` with an absolute path instead. **Upgrading from before 0.2.0: back up your local `.mcp.json` first.** It used to be gitignored, and git silently overwrites an ignored file when a commit starts tracking it — pulling will destroy your dev config with no warning or conflict.
 - **skills/access/SKILL.md**: `/carbon-voice:access`.
 - **skills/configure/SKILL.md**: `/carbon-voice:configure`.
 - **package.json**: Node >= 18, ESM. The `files` allowlist controls the tarball; there is deliberately no `.npmignore`.

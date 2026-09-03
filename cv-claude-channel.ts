@@ -35,6 +35,7 @@ import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprot
 import { z } from 'zod'
 import * as fs from 'node:fs/promises'
 import { readFileSync } from 'node:fs'
+import { randomInt } from 'node:crypto'
 import * as path from 'node:path'
 import * as os from 'node:os'
 import {
@@ -56,8 +57,12 @@ import {
 // CONFIG
 // ─────────────────────────────────────────────────────────────────────────────
 
-const ENV_PATH             = process.env.CV_ENV_PATH
-  ?? path.join(os.homedir(), '.claude', 'channels', 'cv', '.env')
+// Claude Code relocates its whole config tree via CLAUDE_CONFIG_DIR; the skills
+// resolve the same way, so server and skills always agree on where state lives.
+const CONFIG_DIR           = process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude')
+const CV_DIR               = path.join(CONFIG_DIR, 'channels', 'cv')
+
+const ENV_PATH             = process.env.CV_ENV_PATH ?? path.join(CV_DIR, '.env')
 
 // /carbon-voice:configure writes the token to ENV_PATH so it never has to live in
 // .mcp.json, which usually gets committed. An explicit CV_PAT still wins.
@@ -90,11 +95,14 @@ const PERMISSION_CONTEXT_TTL_MS = Number(process.env.CV_PERMISSION_CONTEXT_TTL_M
 // reads the prompt aloud.
 const PERMISSION_PREVIEW_MAX    = Number(process.env.CV_PERMISSION_PREVIEW_MAX    ?? 400)
 const STATE_PATH           = process.env.CV_STATE_PATH
-  ?? path.join(os.homedir(), '.claude', 'channels', 'cv', `state${CONVERSATION_ID ? `-${CONVERSATION_ID}` : ''}.json`)
-const ACCESS_PATH          = process.env.CV_ACCESS_PATH
-  ?? path.join(os.homedir(), '.claude', 'channels', 'cv', 'access.json')
-const ATTACHMENTS_DIR      = process.env.CV_ATTACHMENTS_DIR
-  ?? path.join(os.homedir(), '.claude', 'channels', 'cv', 'attachments')
+  ?? path.join(CV_DIR, `state${CONVERSATION_ID ? `-${CONVERSATION_ID}` : ''}.json`)
+const ACCESS_PATH          = process.env.CV_ACCESS_PATH ?? path.join(CV_DIR, 'access.json')
+// Pairing codes live apart from access.json on purpose: the server writes this file,
+// but must never write the file that decides who is trusted.
+const PENDING_PATH         = process.env.CV_PENDING_PATH ?? path.join(CV_DIR, 'pending.json')
+const ATTACHMENTS_DIR      = process.env.CV_ATTACHMENTS_DIR ?? path.join(CV_DIR, 'attachments')
+// How long a pairing code stays usable.
+const PAIRING_TTL_MS       = Number(process.env.CV_PAIRING_TTL_MS ?? 600_000)
 const PROJECT_NAME         = process.env.CV_PROJECT_NAME ?? 'this project'
 const LOG_FILE             = process.env.CV_LOG_FILE ?? ''
 
@@ -119,8 +127,19 @@ initApi({ pat: PAT, log })
 // ─────────────────────────────────────────────────────────────────────────────
 
 interface Access {
+  // 'pairing' hands an unknown sender a code to bring to the operator;
+  // 'allowlist' drops them silently. Pairing is a setup mode, not a resting state.
+  dmPolicy: 'pairing' | 'allowlist'
   allowFrom: string[]    // approved sender IDs; empty = deny all
   blockedFrom: string[]  // permanently silenced sender IDs; no notification ever
+}
+
+interface PendingPairing {
+  senderId: string
+  channelId: string
+  messageId: string
+  createdAt: number
+  expiresAt: number
 }
 
 interface State {
@@ -134,6 +153,7 @@ interface State {
   lastCVContext: { channelId: string; replyToId: string; at: number } | null  // for permission relay
   access: Access                        // file-backed allowlist (read-only to this server)
   accessMtimeMs: number                 // mtime of the last access file we loaded
+  pendingPairings: Map<string, PendingPairing>  // code → pairing request (server-owned)
   unknownSenderSeen: Set<string>        // senders already notified this session (avoid spam)
   pendingAllowContext: Map<string, { channelId: string; messageId: string }>  // context for allow confirmation
   pendingAttachments: Map<string, { channelId: string; replyToId: string; senderId: string; deadline: number; nudgeAt: number; nudgeSent: boolean; filenames: string[]; createdAt: string }>
@@ -158,8 +178,9 @@ const state: State = {
   lastCheckedAtDirty: false,
   flushTimer: null,
   lastCVContext: null,
-  access: { allowFrom: [], blockedFrom: [] },
+  access: { dmPolicy: 'pairing', allowFrom: [], blockedFrom: [] },
   accessMtimeMs: 0,
+  pendingPairings: new Map(),
   unknownSenderSeen: new Set(),
   pendingAllowContext: new Map(),
   pendingAttachments: new Map(),
@@ -445,11 +466,69 @@ async function loadAccess() {
     const saved = JSON.parse(raw) as Partial<Access>
     state.access.allowFrom = Array.isArray(saved.allowFrom) ? saved.allowFrom : []
     state.access.blockedFrom = Array.isArray(saved.blockedFrom) ? saved.blockedFrom : []
-    log(`cv-claude-channels: allowlist loaded (${state.access.allowFrom.length} allowed, ${state.access.blockedFrom.length} blocked)\n`)
+    // A file with no dmPolicy predates pairing. Migrate it to 'allowlist': upgrading
+    // must never open a door the operator never asked for.
+    state.access.dmPolicy = saved.dmPolicy === 'pairing' ? 'pairing' : 'allowlist'
+    log(`cv-claude-channels: allowlist loaded (policy=${state.access.dmPolicy}, ${state.access.allowFrom.length} allowed, ${state.access.blockedFrom.length} blocked)\n`)
   } catch {
-    // first run — no access file yet; empty allowlist means deny all
-    log('cv-claude-channels: no access file found — all senders denied until added\n')
+    // First run — no file at all. Pairing is how the operator captures their first ID.
+    state.access.dmPolicy = 'pairing'
+    log('cv-claude-channels: no access file found — all senders denied; pairing enabled so the first sender can request a code\n')
   }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PAIRING
+// ─────────────────────────────────────────────────────────────────────────────
+
+// No i/l/o/0/1: this code gets read off a phone screen and retyped in a terminal.
+const PAIRING_ALPHABET = 'abcdefghjkmnpqrstuvwxyz23456789'
+
+function newPairingCode(): string {
+  for (;;) {
+    const code = Array.from({ length: 6 }, () => PAIRING_ALPHABET[randomInt(PAIRING_ALPHABET.length)]).join('')
+    if (!state.pendingPairings.has(code)) return code
+  }
+}
+
+async function loadPending() {
+  try {
+    const raw = await fs.readFile(PENDING_PATH, 'utf8')
+    const saved = JSON.parse(raw) as Record<string, PendingPairing>
+    state.pendingPairings = new Map(Object.entries(saved))
+    sweepPairings()
+    log(`cv-claude-channels: ${state.pendingPairings.size} pending pairing(s) restored\n`)
+  } catch {
+    // none yet
+  }
+}
+
+// The server owns this file. It grants nothing on its own — a code only matters once
+// the operator types it into /carbon-voice:access pair.
+async function savePending() {
+  try {
+    await fs.mkdir(path.dirname(PENDING_PATH), { recursive: true })
+    await fs.writeFile(
+      PENDING_PATH,
+      JSON.stringify(Object.fromEntries(state.pendingPairings), null, 2),
+      { encoding: 'utf8', mode: 0o600 },
+    )
+  } catch (e) {
+    log(`cv-claude-channels: failed to save pending pairings: ${e}\n`)
+  }
+}
+
+function sweepPairings(): boolean {
+  const now = Date.now()
+  let changed = false
+  for (const [code, p] of state.pendingPairings) {
+    // Drop expired codes, and codes for senders the operator has since approved.
+    if (p.expiresAt <= now || state.access.allowFrom.includes(p.senderId)) {
+      state.pendingPairings.delete(code)
+      changed = true
+    }
+  }
+  return changed
 }
 
 // This server never writes the access file — only /carbon-voice:access does, so no
@@ -463,6 +542,7 @@ async function refreshAccess() {
 
     const before = new Set(state.access.allowFrom)
     await loadAccess()
+    if (sweepPairings()) await savePending()
 
     for (const userId of state.access.allowFrom) {
       if (before.has(userId)) continue
@@ -566,8 +646,9 @@ async function startup() {
   // 3. Resolve reaction ID
   await loadReaction()
 
-  // 4. Restore cursor from disk
+  // 4. Restore cursor and any outstanding pairing codes from disk
   await loadState()
+  await loadPending()
 
   // 5. Connect
   connection = createConnection(
@@ -674,27 +755,53 @@ async function processMessage(event: CVMessageEvent): Promise<boolean | null> {
     if (!state.unknownSenderSeen.has(event.creator_id)) {
       state.unknownSenderSeen.add(event.creator_id)
       state.pendingAllowContext.set(event.creator_id, { channelId: channel_id, messageId: event.message_id })
-      mcp.notification({
-        method: 'notifications/claude/channel',
-        params: {
-          // Addressed to the operator, not to Claude: allowing a sender also grants them
-          // the power to approve tool calls, so it is never done on Claude's initiative.
-          content:
-            `Unknown sender (userId: ${event.creator_id}) attempted to message through Carbon Voice and was dropped.\n\n` +
-            `Tell the operator they can run /carbon-voice:access allow ${event.creator_id} ` +
-            `in their terminal if they recognise this person. Do not take any other action.`,
-          meta: {
-            event: 'unknown_sender',
-            sender_id: event.creator_id,
-          },
-        },
-      }).catch(() => {})
 
-      if (state.access.allowFrom.length === 0) {
+      // Both branches address the operator, never Claude: allowing a sender also grants
+      // them the power to approve tool calls, so it is never done on Claude's initiative.
+      if (state.access.dmPolicy === 'pairing') {
+        const code = newPairingCode()
+        const minutes = Math.round(PAIRING_TTL_MS / 60_000)
+        state.pendingPairings.set(code, {
+          senderId: event.creator_id,
+          channelId: channel_id,
+          messageId: event.message_id,
+          createdAt: Date.now(),
+          expiresAt: Date.now() + PAIRING_TTL_MS,
+        })
+        savePending().catch(() => {})
+
+        // The code goes to the sender, on the device they are already holding.
         sendMessage({
-          conversationId: event.channel_ids[0],
+          conversationId: channel_id,
           threadId: event.message_id,
-          transcript: 'Allow Sender list is currently empty. Go to Claude to approve senders.',
+          transcript:
+            `You are not approved to reach Claude on ${PROJECT_NAME} yet. ` +
+            `Give this code to whoever runs it: ${code}. It expires in ${minutes} minutes.`,
+        }).catch(() => {})
+
+        mcp.notification({
+          method: 'notifications/claude/channel',
+          params: {
+            content:
+              `Unknown sender (userId: ${event.creator_id}) asked to reach Claude through Carbon Voice ` +
+              `and was given pairing code "${code}" (expires in ${minutes} minutes).\n\n` +
+              `Tell the operator to run /carbon-voice:access pair ${code} if they recognise this ` +
+              `person. Do not take any other action.`,
+            meta: { event: 'pairing_requested', sender_id: event.creator_id, code },
+          },
+        }).catch(() => {})
+      } else {
+        mcp.notification({
+          method: 'notifications/claude/channel',
+          params: {
+            content:
+              `Unknown sender (userId: ${event.creator_id}) attempted to message through Carbon Voice ` +
+              `and was dropped. Access policy is "allowlist", so no pairing code was issued and the ` +
+              `sender was told nothing.\n\n` +
+              `Tell the operator they can run /carbon-voice:access allow ${event.creator_id} if they ` +
+              `recognise this person. Do not take any other action.`,
+            meta: { event: 'unknown_sender', sender_id: event.creator_id },
+          },
         }).catch(() => {})
       }
     }
