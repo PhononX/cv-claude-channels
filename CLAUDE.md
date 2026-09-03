@@ -73,7 +73,7 @@ claude plugin validate . --strict
 - **cv-api.ts** / **cv-api.test.ts**: CV API client wrapper.
 - **.claude-plugin/plugin.json**: plugin manifest.
 - **.claude-plugin/marketplace.json**: marketplace catalog; points at the npm package.
-- **.mcp.json**: plugin-supplied server config. **Committed** — `--plugin-dir .` and `claude plugin validate` both need it, and the npm tarball is the plugin. Because the plugin root is also the repo root, opening this repo in Claude Code will offer it as a *project* MCP server, where `${CLAUDE_PLUGIN_ROOT}` doesn't expand and the entry fails. Decline it; use `--plugin-dir .` to test the real thing. Put local experiments in `.mcp.json.local`, which is gitignored.
+- **.mcp.json**: plugin-supplied server config. **Committed** — `--plugin-dir .` and `claude plugin validate` both need it, and the npm tarball is the plugin. Because the plugin root is also the repo root, opening this repo in Claude Code will offer it as a *project* MCP server, where `${CLAUDE_PLUGIN_ROOT}` doesn't expand and the entry fails. Decline it; use `--plugin-dir .` to test the real thing. Put local experiments in `.mcp.json.local`, which is gitignored. **Upgrading from before 0.2.0: back up your local `.mcp.json` first.** It used to be gitignored, and git silently overwrites an ignored file when a commit starts tracking it — pulling will destroy your dev config with no warning or conflict.
 - **skills/access/SKILL.md**: `/carbon-voice:access`.
 - **skills/configure/SKILL.md**: `/carbon-voice:configure`.
 - **package.json**: Node >= 18, ESM. The `files` allowlist controls the tarball; there is deliberately no `.npmignore`.
