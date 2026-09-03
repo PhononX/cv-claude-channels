@@ -1,5 +1,6 @@
 {
   "name": "carbonvoice",
+  "description": "Carbon Voice plugins for Claude Code, published by PhononX.",
   "owner": {
     "name": "PhononX",
     "url": "https://github.com/PhononX"

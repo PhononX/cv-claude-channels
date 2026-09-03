@@ -167,6 +167,7 @@ npm install
 npm start          # run against the TypeScript source
 npm run build      # compile to dist/
 npm test           # vitest
+npm run smoke      # protocol smoke test (needs a build first; hits no network)
 ```
 
 Test the plugin without publishing:

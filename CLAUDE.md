@@ -96,8 +96,17 @@ If WebSocket drops, the client polls `/v3/messages/recent` with backoff and resu
 ## Testing
 
 ```bash
-npm test
+npm test                 # unit tests (vitest)
+npm run build && npm run smoke   # protocol smoke test against the built server
 ```
+
+`scripts/smoke.mjs` boots `dist/cv-claude-channel.js` over stdio with a throwaway
+token and asserts the channel surface: both capabilities declared, the server name
+is the `carbon-voice` slug, the tool list is exactly the three read-only/send tools,
+the instructions carry the untrusted-content framing, and **no allowlist write tool
+exists**. It reaches no network — `startup()` is gated behind `confirm_channels`,
+which the script never calls. Run it before publishing; it catches the whole class
+of breakage that unit tests can't see.
 
 Coverage:
 - `permission-relay.test.ts`: verdict parsing (including IDs containing `l`, which Claude Code never issues), prompt formatting (that `input_preview` is present, redaction markers survive, reactions are only advertised when resolved), and pending-request expiry.
