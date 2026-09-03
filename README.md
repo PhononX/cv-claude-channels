@@ -15,15 +15,59 @@ If your computer is offline, messages queue and are delivered when the connectio
 - **Attachments** — files sent in Carbon Voice are downloaded for Claude to read
 - **Deduplication** and **state persistence** — resumes from the last-seen cursor
 
-## Install
+## Setup
 
-```
-/plugin marketplace add PhononX/cv-claude-channel
-/plugin install carbon-voice@carbonvoice
-/carbon-voice:configure <your-personal-access-token>
-```
+### Before you start: you need two Carbon Voice accounts
 
-Then restart Claude Code with the channel enabled — see the table below for which flag applies to you.
+The Personal Access Token identifies the **Claude side** of the conversation. Messages from that account are treated as Claude's own and are ignored, so **you cannot message the channel from the account whose token you used** — nothing will arrive, and there is no error.
+
+So either:
+
+- **Team use (the normal case).** Use your own token. Colleagues message you in Carbon Voice, Claude does the work on your machine and replies in your conversation.
+- **Solo use.** Create a second Carbon Voice account to act as the bot, use *its* token, and message it from your personal account.
+
+### Steps
+
+1. **Get a Personal Access Token** from Carbon Voice, for whichever account is the Claude side.
+
+2. **Install the plugin.**
+
+   ```
+   /plugin marketplace add PhononX/cv-claude-channel
+   /plugin install carbon-voice@carbonvoice
+   ```
+
+   Choose the **user** scope so it works across projects. If the summary says `Run /reload-plugins to activate.`, run that.
+
+3. **Save the token.**
+
+   ```
+   /carbon-voice:configure <your-personal-access-token>
+   ```
+
+   Until you do this the channel's MCP server has no token and exits — `/mcp` showing it as failed before this step is expected, not a bug.
+
+4. **Restart with the channel enabled.** See the table below for the flag your plan needs.
+
+5. **Allow yourself.** Every sender is denied by default, so the first message is *supposed* to be dropped. Send one voice message from your other account. Claude reports the sender ID; then run:
+
+   ```
+   /carbon-voice:access allow <user-id>
+   ```
+
+   That takes effect on the next message — no restart. Message again and it reaches Claude.
+
+Allowing someone lets them send messages Claude acts on **and** approve relayed tool prompts like `Bash` and `Write`. Only allow people you trust with that.
+
+### Troubleshooting the first run
+
+| Symptom | Cause |
+| --- | --- |
+| Nothing arrives, no error | You messaged from the token's own account. Use a different one. |
+| `/mcp` shows the server failed | No token yet — run `/carbon-voice:configure`. |
+| Messages dropped, Claude mentions an unknown sender | Working as intended. Allow the ID (step 5). |
+| Startup says "blocked by org policy" | Your organization has not enabled channels; no flag gets around it. |
+| Channel never connects, but the server is healthy | You started Claude without the channel flag, so the channel isn't registered. |
 
 ### Who can run it, and how
 
