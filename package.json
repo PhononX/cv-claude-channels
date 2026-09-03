@@ -48,6 +48,7 @@
     "node": ">=18.0.0"
   },
   "files": [
+    "npm-shrinkwrap.json",
     "dist",
     ".claude-plugin/plugin.json",
     ".mcp.json",

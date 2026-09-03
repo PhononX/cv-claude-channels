@@ -97,11 +97,39 @@ published. The dev flag may not accept a session-scoped plugin from the
 synthetic `inline` marketplace at all. Until this is settled, use the bare
 server above.
 
-Related unresolved packaging problem: `dist/` is gitignored, so a **git**-sourced
-plugin has no compiled output for `.mcp.json` to run, while the **npm** source
-has `dist/` but may arrive without `node_modules`. Neither source type is
-verified end-to-end yet. Options if it needs solving: commit `dist/`, or have
-`.mcp.json` run the TypeScript source via `tsx`.
+### How plugin dependencies actually get installed
+
+Claude Code copies a plugin into `~/.claude/plugins/cache/...` and installs its
+dependencies there before MCP servers launch — but **only if the plugin root
+contains a supported lockfile**. It runs `npm ci --ignore-scripts` (or
+`bun install --frozen-lockfile --ignore-scripts`), with a 60-second timeout.
+`yarn.lock` and `pnpm-lock.yaml` are deliberately skipped.
+
+**npm excludes `package-lock.json` from published tarballs**, so an npm-source
+plugin must ship `npm-shrinkwrap.json` — and, because this package uses a `files`
+allowlist, that filename has to be listed there too. Miss either half and the
+dependency install is skipped **silently, with no log entry**, and every user
+gets `ERR_MODULE_NOT_FOUND` on first run.
+
+So: regenerate the lockfile with `npm shrinkwrap` (never `package-lock.json`)
+whenever dependencies change, and keep `npm-shrinkwrap.json` in `files`.
+
+Verified end to end by unpacking the tarball and running the real command:
+`npm ci --ignore-scripts` completes in ~4s and the server starts from the
+unpacked copy.
+
+Two consequences worth knowing:
+- `--ignore-scripts` means a dependency needing a native build step will not
+  compile. All current deps are pure JS.
+- Plain `npm ci` installs devDependencies too, so the cache copy is ~92MB. Well
+  inside the 60s budget today, but keep devDependencies lean.
+
+Because dependencies are installed for us, **do not bundle**. Bundling would
+solve a problem the host already handles, at the cost of a 900KB artifact and
+worse stack traces.
+
+Still open: `dist/` is gitignored, so a **git**-sourced install has no compiled
+output. Only the npm source is supported.
 
 ### Environment Variables
 
