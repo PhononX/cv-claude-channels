@@ -25,23 +25,22 @@ Published as `@carbonvoice/cv-claude-channel` on npm, and installable as the `ca
 Only `allow` and `deny` exist on the wire. "Allow always" is ours: it adds the tool name to a session-only set (`state.allowAlwaysTools`) and sends `allow`.
 
 ### State Persistence
-- **Cursor**: Last-checked timestamp on disk (`~/.claude/channels/cv/state.json`), debounced 5s.
+- **Cursor**: Last-checked timestamp on disk (`<config>/channels/cv/state.json`), debounced 5s.
 - **Allowlist**: `<config>/channels/cv/access.json`. **Read-only to this server** — see below.
 - **Pairing codes**: `<config>/channels/cv/pending.json`. **Server-owned**, read by the skill.
 - **Token**: `<config>/channels/cv/.env`, written by `/carbon-voice:configure`.
+- **Pending permissions**: In-memory, with a TTL sweep.
 
 `<config>` is `CLAUDE_CONFIG_DIR` if set, else `~/.claude`. Server and skills
 resolve it identically; individual files can be overridden with `CV_ACCESS_PATH`,
 `CV_PENDING_PATH`, `CV_STATE_PATH`, `CV_ENV_PATH`, `CV_ATTACHMENTS_DIR`.
-- **Pending permissions**: In-memory, with a TTL sweep.
 
 ## Security Model
 
-Two invariants worth not breaking:
+Three invariants worth not breaking:
 
 1. **The server never writes the allowlist.** There is no MCP tool that can add a sender. Only `/carbon-voice:access` (a user-invocable skill that refuses channel-originated requests) writes `access.json`; the server reloads it on mtime change. This exists because inbound transcripts, forwarded messages, and attachment contents all reach Claude unfenced — if a tool could widen access, one crafted message could escalate. And allowlist membership is what authorizes permission approval.
 2. **The server ignores its own reactions** when resolving permission verdicts, so its processed-marker reaction can never read as an approval.
-
 3. **Pairing codes are a request, not a grant.** The server writes `pending.json`
    but never `access.json`, so issuing a code cannot widen access — only the
    operator typing `pair <code>` does. This split is why pairing does not

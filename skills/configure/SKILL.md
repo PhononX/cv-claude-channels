@@ -1,70 +1,93 @@
 ---
 name: configure
-description: Set up the Carbon Voice channel — save the Personal Access Token and check channel status. Use when the user pastes a Carbon Voice token, asks to configure or set up Carbon Voice, or asks why the channel is not connecting.
+description: Set up the Carbon Voice channel — save the Personal Access Token and show channel status. Use when the user pastes a Carbon Voice token, asks to configure or set up Carbon Voice, asks "how do I set this up" or "who can reach me", or asks why the channel is not connecting.
 user-invocable: true
 allowed-tools:
   - Read
   - Write
   - Bash(ls *)
   - Bash(mkdir *)
+  - Bash(cat *)
   - Bash(chmod *)
+  - Bash(echo *)
 ---
 
 # /carbon-voice:configure — Carbon Voice channel setup
 
 Saves the Carbon Voice Personal Access Token where the channel server looks for
 it, so it never has to be written into `.mcp.json` (which usually gets
-committed).
+committed), and reports where setup currently stands.
 
-## Save the token
+**Resolve the state directory first:**
 
-The token goes in:
-
-```
-~/.claude/channels/cv/.env
+```bash
+echo "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/channels/cv"
 ```
 
-Respect `CV_ENV_PATH` if it is set — it overrides that default.
+Use the printed path as `<state-dir>` below. Honor `CV_ENV_PATH` and
+`CV_ACCESS_PATH` if set — they override the individual files.
 
-1. `mkdir -p` the parent directory.
-2. Write the file containing `CV_PAT=<token>`, preserving any other lines that
-   are already there.
+Arguments passed: `$ARGUMENTS`
+
+## Dispatch on arguments
+
+### A token was passed — save it
+
+1. `mkdir -p <state-dir>`.
+2. Write `<state-dir>/.env` containing `CV_PAT=<token>`, preserving any other
+   lines already in the file.
 3. `chmod 600` the file.
+4. Confirm without echoing the token, then show the status view below.
 
-Never echo the token back to the user, and never write it anywhere else — not
-into `.mcp.json`, project files, logs, or the conversation.
+**Never** echo the token back, and never write it anywhere else — not into
+`.mcp.json`, project files, logs, or the conversation.
 
-If the user invoked this skill without a token, tell them to get a Personal
-Access Token from Carbon Voice and re-run `/carbon-voice:configure <token>`.
+Anything that is not a token (`status`, `help`, junk) → show status.
+
+### No args — status and next step
+
+Read the state and report:
+
+1. **Token** — is `CV_PAT` set in `<state-dir>/.env`? If so show it masked:
+   first 6 characters then `...`. Note that an explicit `CV_PAT` in the
+   environment overrides the file.
+2. **Access** — read `<state-dir>/access.json` (missing = `dmPolicy: "pairing"`,
+   empty lists). Show the policy, the allowlist count and IDs, and the number of
+   unexpired codes in `<state-dir>/pending.json`.
+3. **What next** — exactly one concrete step for the current state:
+   - No token → *"Run `/carbon-voice:configure <token>` with a Personal Access
+     Token from Carbon Voice."*
+   - Token set, nobody allowed, no pending codes → *"Restart Claude Code with
+     the channel enabled, then message the channel from your other Carbon Voice
+     account to get a pairing code."*
+   - Codes pending → *"Run `/carbon-voice:access pair \<code\>`."*
+   - Someone allowed, policy still `pairing` → *"Ready. Consider
+     `/carbon-voice:access policy allowlist` to stop issuing new codes."*
+   - Someone allowed, policy `allowlist` → *"Ready."*
+
+## Two things that trip people up
+
+Mention these when they match the user's situation — they look like bugs and
+are not:
+
+- **You cannot message the channel from the account whose token this is.** That
+  account is the Claude side; its own messages are filtered out and nothing
+  arrives, with no error. Solo setups need a second Carbon Voice account to
+  message from.
+- **The server exits when there is no token**, so `/mcp` showing the channel as
+  failed *before* this skill has been run is expected.
 
 ## Optional settings
 
-These are read from the environment, not the `.env` file. Mention them only if
-the user asks:
+Read from the environment, not the `.env` file. Mention only if asked:
 
-- `CV_CONVERSATION_ID` — scope the channel to a single conversation.
-- `CV_PROJECT_NAME` — name used when telling a newly allowed sender which
-  project they have reached.
-- `CV_LOG_FILE` — mirror the server's stderr log to a file.
-- `CV_PERMISSION_TTL_MS` — how long a relayed approval prompt stays answerable
-  (default 10 minutes).
+- `CV_CONVERSATION_ID` — scope the channel to one conversation.
+- `CV_PROJECT_NAME` — the project name shown to a sender being paired.
+- `CV_PAIRING_TTL_MS` — how long a pairing code lasts (default 10 minutes).
+- `CV_PERMISSION_TTL_MS` — how long a relayed approval prompt stays answerable.
+- `CV_LOG_FILE` — mirror the server log to a file.
 
 ## After configuring
 
-The channel does not start until the session is launched with it enabled, and
-the server has to be restarted to pick up a new token. Tell the user to restart
-Claude Code with:
-
-```bash
-claude --dangerously-load-development-channels plugin:carbon-voice@carbonvoice
-```
-
-Then explain the two remaining steps:
-
-1. **Nobody is allowed yet.** The allowlist starts empty and every sender is
-   denied. Have them message the channel once from Carbon Voice, then run
-   `/carbon-voice:access allow <user-id>` with the ID from the unknown-sender
-   notification.
-2. If they are on a Team or Enterprise plan and see a "blocked by org policy"
-   notice at startup, an admin has to enable channels for the organization
-   before any of this works.
+The server reads the token at boot, so a new token needs a restart. See the
+README for which startup flag your plan requires.
