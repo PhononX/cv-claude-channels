@@ -40,7 +40,7 @@ import * as path from 'node:path'
 import * as os from 'node:os'
 import {
   init as initApi,
-  whoami, getReactions, addReaction, markRead,
+  whoami, addReaction, markRead,
   sendMessage, getRecentMessages, getShareLink, attachmentFromString,
   downloadAttachmentsToDir, downloadShareLinkAttachmentsToDir,
   createConnection,
@@ -52,6 +52,7 @@ import {
   formatPermissionPrompt, parseVerdict, findOpenRequest, sweepExpired,
   type PendingPermission,
 } from './permission-relay.js'
+import { canonicalReactionKey, collectReactors, hasReacted, isSingleEmoji } from './reactions.js'
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CONFIG
@@ -77,14 +78,18 @@ function patFromEnvFile(): string {
 
 const PAT                  = process.env.CV_PAT || patFromEnvFile()
 const CONVERSATION_ID      = process.env.CV_CONVERSATION_ID ?? ''   // optional: scope to one conversation
-const REACTION_ID          = process.env.CV_REACTION_ID ?? ''       // optional: pin a specific reaction ID
+// Reactions are plain emoji since CV-13453, so these are used verbatim — there is no
+// catalog lookup and nothing to resolve at startup. Defaults are curated emoji, which
+// appear in the app's one-tap quick row; the processed marker is deliberately NOT one
+// of the approval emoji so acknowledging a message can never read as approving it.
+const PROCESSED_REACTION   = process.env.CV_REACTION_ID ?? '👀'
 const POLL_INTERVAL_MS          = Number(process.env.CV_POLL_INTERVAL_MS           ?? 5_000)
 const WS_RETRY_MAX_MS           = Number(process.env.CV_WS_RETRY_MAX_MS            ?? 30_000)
 const ATTACHMENT_TIMEOUT_MS     = Number(process.env.CV_ATTACHMENT_TIMEOUT_MS      ?? 600_000)
 const ATTACHMENT_NUDGE_MS       = Number(process.env.CV_ATTACHMENT_NUDGE_MS        ?? 120_000)
-const PERMISSION_ALLOW_REACTION        = process.env.CV_PERMISSION_ALLOW_REACTION        ?? 'acknowledged'
-const PERMISSION_ALLOW_ALWAYS_REACTION = process.env.CV_PERMISSION_ALLOW_ALWAYS_REACTION ?? 'affirmative'
-const PERMISSION_DENY_REACTION         = process.env.CV_PERMISSION_DENY_REACTION         ?? 'negative'
+const PERMISSION_ALLOW_REACTION        = canonicalReactionKey(process.env.CV_PERMISSION_ALLOW_REACTION        ?? '✅')
+const PERMISSION_ALLOW_ALWAYS_REACTION = canonicalReactionKey(process.env.CV_PERMISSION_ALLOW_ALWAYS_REACTION ?? '💯')
+const PERMISSION_DENY_REACTION         = canonicalReactionKey(process.env.CV_PERMISSION_DENY_REACTION         ?? '⛔')
 // A relayed prompt stops being answerable after this long, so a verdict can't resolve
 // a request the operator has long since forgotten about.
 const PERMISSION_TTL_MS         = Number(process.env.CV_PERMISSION_TTL_MS         ?? 600_000)
@@ -122,6 +127,20 @@ if (!PAT) {
 
 initApi({ pat: PAT, log })
 
+for (const [label, value] of [
+  ['CV_REACTION_ID', PROCESSED_REACTION],
+  ['CV_PERMISSION_ALLOW_REACTION', PERMISSION_ALLOW_REACTION],
+  ['CV_PERMISSION_ALLOW_ALWAYS_REACTION', PERMISSION_ALLOW_ALWAYS_REACTION],
+  ['CV_PERMISSION_DENY_REACTION', PERMISSION_DENY_REACTION],
+] as const) {
+  if (!isSingleEmoji(value)) {
+    log(`cv-claude-channels: WARNING: ${label}="${value}" is not a single emoji — Carbon Voice will reject it\n`)
+  }
+}
+if ([PERMISSION_ALLOW_REACTION, PERMISSION_ALLOW_ALWAYS_REACTION, PERMISSION_DENY_REACTION].includes(PROCESSED_REACTION)) {
+  log(`cv-claude-channels: WARNING: the processed marker "${PROCESSED_REACTION}" is also an approval reaction — acknowledging a message would read as approving it\n`)
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // TYPES
 // ─────────────────────────────────────────────────────────────────────────────
@@ -145,7 +164,6 @@ interface PendingPairing {
 interface State {
   lastCheckedAt: string | null             // null = never fetched; set to now on first poll
   ownUserId: string                     // used to filter self-messages
-  reactionId: string | null             // reaction to add on receipt; null until resolved
   fetchInFlight: boolean                 // coalescing guard: fetch currently running
   fetchQueued: boolean                   // coalescing guard: another fetch waiting
   lastCheckedAtDirty: boolean              // pending disk write
@@ -160,7 +178,6 @@ interface State {
   attachmentFollowUpSent: Set<string>  // message IDs for which attachment follow-up has been sent
   pendingPermissionMessages: Map<string, PendingPermission>  // cvMessageId → permission request
   allowAlwaysTools: Set<string>           // tools auto-approved for this session
-  permissionReactionIds: { allow: string | null; allowAlways: string | null; deny: string | null }
   cvStarted: boolean                    // true once startup() has been called
 }
 
@@ -172,7 +189,6 @@ interface State {
 const state: State = {
   lastCheckedAt: null,
   ownUserId: process.env.CV_OWN_USER_ID ?? '',
-  reactionId: REACTION_ID || 'acknowledged',
   fetchInFlight: false,
   fetchQueued: false,
   lastCheckedAtDirty: false,
@@ -187,7 +203,6 @@ const state: State = {
   attachmentFollowUpSent: new Set(),
   pendingPermissionMessages: new Map(),
   allowAlwaysTools: new Set(),
-  permissionReactionIds: { allow: null, allowAlways: null, deny: null },
   cvStarted: false,
 }
 
@@ -200,7 +215,7 @@ let connection: CVConnection | null = null
 const mcp = new Server(
   // Slug, not a display name: Claude Code derives the <channel source="..."> attribute
   // from this, so it has to be a valid identifier.
-  { name: 'carbon-voice', version: '0.2.0' },
+  { name: 'carbon-voice', version: '0.3.0' },
   {
     capabilities: {
       experimental: {
@@ -429,15 +444,14 @@ mcp.setNotificationHandler(PermissionRequestSchema, async ({ params }) => {
     return
   }
 
-  // Reaction IDs only resolve inside startup(), which is gated behind confirm_channels.
-  const rx = state.permissionReactionIds
-
   const text = formatPermissionPrompt({
     toolName: params.tool_name,
     description: params.description,
     inputPreview: params.input_preview,
     requestId: params.request_id,
-    reactionsReady: Boolean(rx.allow || rx.allowAlways || rx.deny),
+    allowEmoji: PERMISSION_ALLOW_REACTION,
+    allowAlwaysEmoji: PERMISSION_ALLOW_ALWAYS_REACTION,
+    denyEmoji: PERMISSION_DENY_REACTION,
     previewMax: PERMISSION_PREVIEW_MAX,
   })
 
@@ -564,72 +578,6 @@ async function refreshAccess() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// REACTIONS
-// ─────────────────────────────────────────────────────────────────────────────
-
-async function loadReaction() {
-  const reactions = await getReactions()
-  if (reactions.length === 0) {
-    log('cv-claude-channels: no reactions available\n')
-    return
-  }
-
-  log('cv-claude-channels: available reactions:\n')
-  for (const r of reactions) {
-    log(`  id=${r.id}  name="${r.name}"  code="${r.code}"\n`)
-  }
-
-  // Resolve code/name → actual UUID if the configured value isn't already a known ID.
-  // top_user_reactions stores the UUID, so the check in isProcessed must compare UUIDs.
-  if (state.reactionId) {
-    const byId = reactions.find(r => r.id === state.reactionId)
-    if (!byId) {
-      const byCode = reactions.find(
-        r => r.code === state.reactionId || r.name.toLowerCase() === state.reactionId!.toLowerCase(),
-      )
-      if (byCode) {
-        log(`cv-claude-channels: resolved reaction "${state.reactionId}" → id="${byCode.id}"\n`)
-        state.reactionId = byCode.id
-      } else {
-        log(`cv-claude-channels: WARNING: reaction "${state.reactionId}" not found — isProcessed checks will always miss\n`)
-      }
-    }
-  }
-
-  log(`cv-claude-channels: using reaction id=${state.reactionId}\n`)
-
-  // Resolve the three permission-approval reaction IDs
-  const resolvePermReaction = (nameOrId: string): string | null => {
-    const byId = reactions.find(r => r.id === nameOrId)
-    if (byId) return byId.id
-    const byCode = reactions.find(
-      r => r.code === nameOrId || r.name.toLowerCase() === nameOrId.toLowerCase(),
-    )
-    if (byCode) {
-      log(`cv-claude-channels: resolved permission reaction "${nameOrId}" → id="${byCode.id}"\n`)
-      return byCode.id
-    }
-    log(`cv-claude-channels: WARNING: permission reaction "${nameOrId}" not found\n`)
-    return null
-  }
-
-  state.permissionReactionIds = {
-    allow:      resolvePermReaction(PERMISSION_ALLOW_REACTION),
-    allowAlways: resolvePermReaction(PERMISSION_ALLOW_ALWAYS_REACTION),
-    deny:       resolvePermReaction(PERMISSION_DENY_REACTION),
-  }
-  log(`cv-claude-channels: permission reactions: allow=${state.permissionReactionIds.allow} allowAlways=${state.permissionReactionIds.allowAlways} deny=${state.permissionReactionIds.deny}\n`)
-
-  // The processed marker and an approval reaction must never resolve to the same id, or
-  // merely acknowledging a message would read as approving a tool call.
-  for (const [label, id] of Object.entries(state.permissionReactionIds)) {
-    if (id && id === state.reactionId) {
-      log(`cv-claude-channels: WARNING: permission reaction "${label}" resolves to the same id as the processed marker (${id}) — set CV_REACTION_ID or the CV_PERMISSION_*_REACTION vars to distinct reactions\n`)
-    }
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 // STARTUP: identity + state restore
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -643,14 +591,11 @@ async function startup() {
   // 2. Load allowlist from disk
   await loadAccess()
 
-  // 3. Resolve reaction ID
-  await loadReaction()
-
-  // 4. Restore cursor and any outstanding pairing codes from disk
+  // 3. Restore cursor and any outstanding pairing codes from disk
   await loadState()
   await loadPending()
 
-  // 5. Connect
+  // 4. Connect
   connection = createConnection(
     { conversationId: CONVERSATION_ID, pollIntervalMs: POLL_INTERVAL_MS, wsRetryMaxMs: WS_RETRY_MAX_MS },
     {
@@ -716,10 +661,8 @@ function updateCursor(isoTimestamp: string) {
 
 // The reaction is our sole processed marker — it lives on the server and survives restarts.
 function isProcessed(event: CVMessageEvent): boolean {
-  if (!state.reactionId) return false
-  return event.reaction_summary?.top_user_reactions?.some(
-    r => r.user_id === state.ownUserId && r.reaction_id === state.reactionId,
-  ) ?? false
+  if (!state.ownUserId) return false
+  return hasReacted(event.reaction_summary, PROCESSED_REACTION, state.ownUserId)
 }
 
 async function markProcessed(event: CVMessageEvent): Promise<void> {
@@ -727,7 +670,7 @@ async function markProcessed(event: CVMessageEvent): Promise<void> {
     log(`cv-claude-channels: WARNING double-process on ${event.message_id} — reaction already present, skipping addReaction\n`)
     return
   }
-  if (state.reactionId) await addReaction(state.reactionId, event.message_id)
+  await addReaction(PROCESSED_REACTION, event.message_id)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1042,30 +985,34 @@ async function checkPendingPermissions(messages: CVMessageEvent[]): Promise<void
   const matched = messages.filter(m => state.pendingPermissionMessages.has(m.message_id))
   log(`cv-claude-channels: checkPendingPermissions: ${matched.length} matched in batch (${matched.map(m => m.message_id).join(', ')})\n`)
   for (const m of matched) {
-    log(`cv-claude-channels: checkPendingPermissions: message ${m.message_id} reactions=${JSON.stringify(m.reaction_summary?.top_user_reactions)}\n`)
+    log(`cv-claude-channels: checkPendingPermissions: message ${m.message_id} reactors=${JSON.stringify([...collectReactors(m.reaction_summary)].map(([e, u]) => [e, [...u]]))}\n`)
   }
 
-  const { allow, allowAlways, deny } = state.permissionReactionIds
+  const verdictByEmoji = new Map<string, string>([
+    [PERMISSION_ALLOW_REACTION, 'allow'],
+    [PERMISSION_ALLOW_ALWAYS_REACTION, 'allow_always'],
+    [PERMISSION_DENY_REACTION, 'deny'],
+  ])
 
   for (const msg of messages) {
     const pending = state.pendingPermissionMessages.get(msg.message_id)
     if (!pending) continue
 
-    const reactions = msg.reaction_summary?.top_user_reactions ?? []
-    for (const rxn of reactions) {
+    // Collapses legacy slugs and emoji from both summary shapes onto one key.
+    const reactors = collectReactors(msg.reaction_summary)
+
+    for (const [emoji, behavior] of verdictByEmoji) {
+      const users = reactors.get(emoji)
+      if (!users) continue
+
       // The bot stamps its own processed-marker reaction on messages; that must never
       // count as a human approving a tool call.
-      if (state.ownUserId && rxn.user_id === state.ownUserId) continue
-      if (!state.access.allowFrom.includes(rxn.user_id)) continue
+      const approver = [...users].find(
+        u => u !== state.ownUserId && state.access.allowFrom.includes(u),
+      )
+      if (!approver) continue
 
-      let behavior: string | null = null
-      if (allow && rxn.reaction_id === allow) behavior = 'allow'
-      else if (allowAlways && rxn.reaction_id === allowAlways) behavior = 'allow_always'
-      else if (deny && rxn.reaction_id === deny) behavior = 'deny'
-
-      if (!behavior) continue
-
-      log(`cv-claude-channels: permission verdict via reaction: ${behavior} for request ${pending.requestId} (from ${rxn.user_id})\n`)
+      log(`cv-claude-channels: permission verdict via reaction: ${behavior} for request ${pending.requestId} (from ${approver})\n`)
 
       if (behavior === 'allow_always') {
         state.allowAlwaysTools.add(pending.toolName)

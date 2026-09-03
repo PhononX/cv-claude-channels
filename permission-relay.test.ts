@@ -80,7 +80,9 @@ describe('formatPermissionPrompt', () => {
     description: 'Delete the build directory',
     inputPreview: '{"command":"rm -rf ./build"}',
     requestId: 'abcde',
-    reactionsReady: true,
+    allowEmoji: '✅',
+    allowAlwaysEmoji: '💯',
+    denyEmoji: '⛔',
     previewMax: 400,
   }
 
@@ -105,11 +107,18 @@ describe('formatPermissionPrompt', () => {
     expect(formatPermissionPrompt(base)).toContain('"no abcde"')
   })
 
-  it('advertises reactions only once they have resolved', () => {
-    expect(formatPermissionPrompt(base)).toContain('✅')
-    const notReady = formatPermissionPrompt({ ...base, reactionsReady: false })
-    expect(notReady).not.toContain('✅')
-    expect(notReady).toContain('"yes abcde"')
+  it('names the exact emoji the verdict poller matches', () => {
+    const out = formatPermissionPrompt(base)
+    expect(out).toContain('✅ = allow once')
+    expect(out).toContain('⛔ = deny')
+  })
+
+  it('reflects custom emoji rather than hardcoding the defaults', () => {
+    // Prompt and poller read the same config, so they cannot drift apart.
+    const out = formatPermissionPrompt({ ...base, allowEmoji: '🟢', denyEmoji: '🔴' })
+    expect(out).toContain('🟢 = allow once')
+    expect(out).toContain('🔴 = deny')
+    expect(out).not.toContain('✅')
   })
 
   it('names the tool in the allow-always label, since the scope is the whole tool', () => {

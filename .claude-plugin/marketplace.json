@@ -13,7 +13,7 @@
         "package": "@carbonvoice/cv-claude-channel"
       },
       "description": "Carbon Voice channel for Claude Code — send voice messages into a running session and get spoken replies back, with remote tool-approval relay.",
-      "version": "0.2.0",
+      "version": "0.3.0",
       "displayName": "Carbon Voice",
       "author": {
         "name": "PhononX"

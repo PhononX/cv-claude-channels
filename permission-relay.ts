@@ -51,21 +51,24 @@ export function formatPermissionPrompt(opts: {
   description: string
   inputPreview: string
   requestId: string
-  reactionsReady: boolean
+  allowEmoji: string
+  allowAlwaysEmoji: string
+  denyEmoji: string
   previewMax: number
 }): string {
-  const { toolName, description, inputPreview, requestId, reactionsReady, previewMax } = opts
+  const { toolName, description, inputPreview, requestId, previewMax } = opts
+  const { allowEmoji, allowAlwaysEmoji, denyEmoji } = opts
 
   // description alone is often the constant "Run shell command" with zero detail, so
   // inputPreview is the part that actually says what is being approved.
   const summary = description || '(no description given)'
   const preview = trimPreview(inputPreview, previewMax)
 
-  // Reaction IDs only resolve once the channel is connected. Advertising the emoji
-  // before then would offer buttons that silently do nothing.
-  const reactionHelp = reactionsReady
-    ? `✅ = allow once. 💯 = allow ${toolName} for the rest of this session, whatever the arguments. 👎 = deny.\n`
-    : ''
+  // Emoji are configuration, not looked-up ids, so the prompt always names the exact
+  // glyph the verdict poller matches — the two can no longer drift.
+  const reactionHelp =
+    `${allowEmoji} = allow once. ${allowAlwaysEmoji} = allow ${toolName} for the rest of ` +
+    `this session, whatever the arguments. ${denyEmoji} = deny.\n`
 
   return (
     `Claude wants to run ${toolName}: ${summary}\n\n` +

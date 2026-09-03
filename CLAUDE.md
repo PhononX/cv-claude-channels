@@ -19,7 +19,7 @@ Published as `@carbonvoice/cv-claude-channel` on npm, and installable as the `ca
 1. Claude Code sends `notifications/claude/channel/permission_request` with `request_id`, `tool_name`, `description`, `input_preview`.
 2. We format a prompt (`permission-relay.ts`) that includes **`input_preview`**, not just `description` — for Bash the description is often the bare constant `Run shell command`.
 3. The prompt goes to the conversation that most recently spoke, provided that context is fresher than `CV_PERMISSION_CONTEXT_TTL_MS`.
-4. The user reacts (✅ / 💯 / 👎) or replies `yes <id>` / `no <id>`.
+4. The user reacts (✅ / 💯 / ⛔) or replies `yes <id>` / `no <id>`.
 5. We emit `notifications/claude/channel/permission` with `behavior: 'allow' | 'deny'`.
 
 Only `allow` and `deny` exist on the wire. "Allow always" is ours: it adds the tool name to a session-only set (`state.allowAlwaysTools`) and sends `allow`.
@@ -157,10 +157,34 @@ output. Only the npm source is supported.
 
 ## Key Concepts
 
-### Reaction IDs
-Permission verdicts round-trip via reactions: each of allow / allow-always / deny maps to a reaction ID resolved at startup from a name, code, or ID. Resolution happens inside `startup()`, which is gated behind `confirm_channels`, so the IDs are `null` until the channel is confirmed — the prompt only advertises the emoji once they resolve, and otherwise offers just the text fallback.
+### Reactions are emoji
 
-The processed marker and the "allow once" reaction default to the same reaction (`acknowledged`). They are only ever compared against different messages and the server ignores its own reactions, but the server logs a warning if they collide.
+Since Carbon Voice's full-emoji migration (CV-13453) reactions are plain unicode
+emoji. This server does **not** call `GET /reactions` — that endpoint survives only
+for old app versions (CV-13516) — so there is no catalog fetch, no name/code→id
+resolution, and nothing about reactions that has to wait for `confirm_channels`.
+
+`reactions.ts` owns three things:
+
+- `CURATED_SLUG_TO_EMOJI` — the frozen legacy catalog. **Must mirror cv-api's
+  `CURATED_EMOJI_BY_REACTION_ID`** and carbon-voice-flutter's
+  `CuratedReactions.slugToEmoji`; divergence silently splits one reaction in two.
+- `collectReactors()` — the CV-13479 contract split means a summary can carry
+  `top_user_reactions` (legacy, per-user pairs, possibly slugs) and
+  `top_user_emojis` (emoji-native, grouped with `user_ids`) **at the same time**.
+  This flattens both onto canonical-emoji → reactors, so callers never care which
+  shape a reaction arrived in.
+- `isSingleEmoji()` — mirrors the cv-api validator, so we never send what the
+  server rejects. Checked at startup against every configured reaction.
+
+Writes go to the body-based endpoint `POST /reactions/message/:id` with
+`{"reaction": ...}`, which accepts a curated id or any single emoji. The old
+path-based route cannot carry emoji at all.
+
+Defaults are 👀 marker, ✅ allow, 💯 allow-always, ⛔ deny. The three approval
+emoji are in the app's one-tap quick row; the marker is deliberately none of them,
+and startup warns if that is overridden into a collision.
+
 
 ### Deduplication
 A reaction on the source message is the durable processed marker (survives restarts); the cursor bounds what gets fetched. If the same message arrives twice, the marker drops the duplicate.

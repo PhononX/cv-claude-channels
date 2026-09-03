@@ -21,7 +21,10 @@ export interface CVTimecode { t: string; s: number; e: number }
 
 export interface CVReactionSummary {
   reaction_counts: Record<string, number>
+  // Legacy shape: one entry per user/reaction pair, identifier may be a curated slug.
   top_user_reactions: Array<{ user_id: string; reaction_id: string }>
+  // Emoji-native shape added by the CV-13479 contract split, grouped per reaction.
+  top_user_emojis?: Array<{ reaction: string; count: number; user_ids: string[] }>
 }
 
 export interface CVAttachment {
@@ -71,14 +74,6 @@ export interface CVShareLink {
   revoked_at?: string | null
   has_channel_access?: boolean
   shared_message?: CVSharedMessage
-}
-
-export interface Reaction {
-  id: string
-  name: string
-  code: string
-  reaction_tts: string
-  image_url: string
 }
 
 export interface LinkAttachment {
@@ -140,19 +135,10 @@ export async function whoami(): Promise<string> {
 // REACTIONS
 // ─────────────────────────────────────────────────────────────────────────────
 
-export async function getReactions(): Promise<Reaction[]> {
-  const res = await cvFetch('GET', '/reactions')
-  if (!res.ok) {
-    _log(`cv-claude-channels: GET /reactions failed ${res.status}\n`)
-    return []
-  }
-  const data = await res.json() as Reaction[]
-  return Array.isArray(data) ? data : []
-}
 
-export async function addReaction(reactionId: string, messageId: string): Promise<void> {
-  _log(`cv-claude-channels: addReaction ${reactionId} on ${messageId}\n`)
-  const res = await cvFetch('POST', `/reactions/${reactionId}/${messageId}`)
+export async function addReaction(reaction: string, messageId: string): Promise<void> {
+  _log(`cv-claude-channels: addReaction ${reaction} on ${messageId}\n`)
+  const res = await cvFetch('POST', `/reactions/message/${messageId}`, { reaction })
   if (!res.ok) {
     _log(`cv-claude-channels: addReaction failed ${res.status} for ${messageId}\n`)
   }

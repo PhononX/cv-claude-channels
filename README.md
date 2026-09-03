@@ -133,13 +133,13 @@ The Personal Access Token is the only required setting. `/carbon-voice:configure
 | `CV_PERMISSION_TTL_MS` | `600000` | How long a relayed approval prompt stays answerable |
 | `CV_PERMISSION_CONTEXT_TTL_MS` | `600000` | How stale the target conversation may be before a prompt is not relayed |
 | `CV_PERMISSION_PREVIEW_MAX` | `400` | Characters of tool input shown in a relayed prompt |
-| `CV_REACTION_ID` | `acknowledged` | Reaction used as the processed marker |
-| `CV_PERMISSION_ALLOW_REACTION` | `acknowledged` | Reaction meaning "allow once" |
-| `CV_PERMISSION_ALLOW_ALWAYS_REACTION` | `affirmative` | Reaction meaning "allow for this session" |
-| `CV_PERMISSION_DENY_REACTION` | `negative` | Reaction meaning "deny" |
+| `CV_REACTION_ID` | 👀 | Emoji used as the processed marker |
+| `CV_PERMISSION_ALLOW_REACTION` | ✅ | Emoji meaning "allow once" |
+| `CV_PERMISSION_ALLOW_ALWAYS_REACTION` | 💯 | Emoji meaning "allow for this session" |
+| `CV_PERMISSION_DENY_REACTION` | ⛔ | Emoji meaning "deny" |
 | `CV_LOG_FILE` | stderr only | Mirror the log to a file |
 
-> The processed marker and the "allow once" reaction default to the same reaction. They are only ever compared against different messages, and the server ignores its own reactions, but setting them to distinct reactions is clearer — the server logs a warning at startup if they collide.
+> These take a single emoji (any emoji, not just the curated set) or a legacy curated slug, which is normalized to its emoji. The four defaults are deliberately distinct, and the server warns at startup if the marker collides with an approval emoji or if a value is not a single emoji.
 
 ## Usage
 
@@ -164,7 +164,7 @@ Claude wants to run Bash: Delete the build directory
 
 {"command":"rm -rf ./build"}
 
-✅ = allow once. 💯 = allow Bash for the rest of this session, whatever the arguments. 👎 = deny.
+✅ = allow once. 💯 = allow Bash for the rest of this session, whatever the arguments. ⛔ = deny.
 Or reply "yes abcde" or "no abcde".
 ```
 
