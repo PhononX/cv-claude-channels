@@ -58,7 +58,7 @@ setTimeout(() => {
   const experimental = init?.capabilities?.experimental ?? {}
 
   const checks = [
-    ['server advertises the carbon-voice slug', init?.serverInfo?.name === 'carbon-voice'],
+    ['server advertises the cv-channel slug', init?.serverInfo?.name === 'cv-channel'],
     ['claude/channel capability declared', 'claude/channel' in experimental],
     ['claude/channel/permission capability declared', 'claude/channel/permission' in experimental],
     ['send_message exposed', tools.includes('send_message')],

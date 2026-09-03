@@ -51,9 +51,9 @@ export function formatPermissionPrompt(opts: {
   description: string
   inputPreview: string
   requestId: string
-  allowEmoji: string
-  allowAlwaysEmoji: string
-  denyEmoji: string
+  allowEmoji: string[]
+  allowAlwaysEmoji: string[]
+  denyEmoji: string[]
   previewMax: number
 }): string {
   const { toolName, description, inputPreview, requestId, previewMax } = opts
@@ -66,9 +66,12 @@ export function formatPermissionPrompt(opts: {
 
   // Emoji are configuration, not looked-up ids, so the prompt always names the exact
   // glyph the verdict poller matches — the two can no longer drift.
+  // Every accepted glyph is named, so a reader is never told to tap one emoji while the
+  // poller quietly also honours another.
+  const glyphs = (list: string[]) => list.join(' or ')
   const reactionHelp =
-    `${allowEmoji} = allow once. ${allowAlwaysEmoji} = allow ${toolName} for the rest of ` +
-    `this session, whatever the arguments. ${denyEmoji} = deny.\n`
+    `${glyphs(allowEmoji)} = allow once. ${glyphs(allowAlwaysEmoji)} = allow ${toolName} ` +
+    `for the rest of this session, whatever the arguments. ${glyphs(denyEmoji)} = deny.\n`
 
   return (
     `Claude wants to run ${toolName}: ${summary}\n\n` +

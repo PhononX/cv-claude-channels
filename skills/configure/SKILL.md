@@ -12,7 +12,7 @@ allowed-tools:
   - Bash(echo *)
 ---
 
-# /carbon-voice:configure — Carbon Voice channel setup
+# /cv-channel:configure — Carbon Voice channel setup
 
 Saves the Carbon Voice Personal Access Token where the channel server looks for
 it, so it never has to be written into `.mcp.json` (which usually gets
@@ -55,14 +55,14 @@ Read the state and report:
    empty lists). Show the policy, the allowlist count and IDs, and the number of
    unexpired codes in `<state-dir>/pending.json`.
 3. **What next** — exactly one concrete step for the current state:
-   - No token → *"Run `/carbon-voice:configure <token>` with a Personal Access
+   - No token → *"Run `/cv-channel:configure <token>` with a Personal Access
      Token from Carbon Voice."*
    - Token set, nobody allowed, no pending codes → *"Restart Claude Code with
      the channel enabled, then message the channel from your other Carbon Voice
      account to get a pairing code."*
-   - Codes pending → *"Run `/carbon-voice:access pair \<code\>`."*
+   - Codes pending → *"Run `/cv-channel:access pair \<code\>`."*
    - Someone allowed, policy still `pairing` → *"Ready. Consider
-     `/carbon-voice:access policy allowlist` to stop issuing new codes."*
+     `/cv-channel:access policy allowlist` to stop issuing new codes."*
    - Someone allowed, policy `allowlist` → *"Ready."*
 
 ## Two things that trip people up

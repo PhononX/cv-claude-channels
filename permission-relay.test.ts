@@ -80,9 +80,9 @@ describe('formatPermissionPrompt', () => {
     description: 'Delete the build directory',
     inputPreview: '{"command":"rm -rf ./build"}',
     requestId: 'abcde',
-    allowEmoji: '✅',
-    allowAlwaysEmoji: '💯',
-    denyEmoji: '⛔',
+    allowEmoji: ['✅'],
+    allowAlwaysEmoji: ['💯'],
+    denyEmoji: ['⛔', '👎'],
     previewMax: 400,
   }
 
@@ -110,12 +110,16 @@ describe('formatPermissionPrompt', () => {
   it('names the exact emoji the verdict poller matches', () => {
     const out = formatPermissionPrompt(base)
     expect(out).toContain('✅ = allow once')
-    expect(out).toContain('⛔ = deny')
+  })
+
+  it('names every accepted glyph, not just the first', () => {
+    // The poller honours both ⛔ and 👎, so the prompt must not advertise only one.
+    expect(formatPermissionPrompt(base)).toContain('⛔ or 👎 = deny')
   })
 
   it('reflects custom emoji rather than hardcoding the defaults', () => {
     // Prompt and poller read the same config, so they cannot drift apart.
-    const out = formatPermissionPrompt({ ...base, allowEmoji: '🟢', denyEmoji: '🔴' })
+    const out = formatPermissionPrompt({ ...base, allowEmoji: ['🟢'], denyEmoji: ['🔴'] })
     expect(out).toContain('🟢 = allow once')
     expect(out).toContain('🔴 = deny')
     expect(out).not.toContain('✅')

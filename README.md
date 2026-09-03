@@ -34,7 +34,7 @@ So either:
 
    ```
    /plugin marketplace add PhononX/cv-claude-channel
-   /plugin install carbon-voice@carbonvoice
+   /plugin install cv-channel@carbonvoice
    ```
 
    Choose the **user** scope so it works across projects. If the summary says `Run /reload-plugins to activate.`, run that.
@@ -42,7 +42,7 @@ So either:
 3. **Save the token.**
 
    ```
-   /carbon-voice:configure <your-personal-access-token>
+   /cv-channel:configure <your-personal-access-token>
    ```
 
    Until you do this the channel's MCP server has no token and exits — `/mcp` showing it as failed before this step is expected, not a bug.
@@ -52,7 +52,7 @@ So either:
 5. **Allow yourself.** Every sender is denied by default, so the first message is *supposed* to be dropped. Send one voice message from your other account. Claude reports the sender ID; then run:
 
    ```
-   /carbon-voice:access allow <user-id>
+   /cv-channel:access allow <user-id>
    ```
 
    That takes effect on the next message — no restart. Message again and it reaches Claude.
@@ -64,7 +64,7 @@ Allowing someone lets them send messages Claude acts on **and** approve relayed 
 | Symptom | Cause |
 | --- | --- |
 | Nothing arrives, no error | You messaged from the token's own account. Use a different one. |
-| `/mcp` shows the server failed | No token yet — run `/carbon-voice:configure`. |
+| `/mcp` shows the server failed | No token yet — run `/cv-channel:configure`. |
 | Messages dropped, Claude mentions an unknown sender | Working as intended. Allow the ID (step 5). |
 | Startup says "blocked by org policy" | Your organization has not enabled channels; no flag gets around it. |
 | Channel never connects, but the server is healthy | You started Claude without the channel flag, so the channel isn't registered. |
@@ -75,8 +75,8 @@ Channels are in research preview, and which flag you need depends on your plan:
 
 | You are | Command | Prerequisites |
 | --- | --- | --- |
-| Pro/Max, no organization | `claude --dangerously-load-development-channels plugin:carbon-voice@carbonvoice` | none |
-| Team/Enterprise | `claude --channels plugin:carbon-voice@carbonvoice` | admin sets **both** `channelsEnabled` and `allowedChannelPlugins` |
+| Pro/Max, no organization | `claude --dangerously-load-development-channels plugin:cv-channel@carbonvoice` | none |
+| Team/Enterprise | `claude --channels plugin:cv-channel@carbonvoice` | admin sets **both** `channelsEnabled` and `allowedChannelPlugins` |
 
 Two things worth knowing before you file a bug:
 
@@ -89,7 +89,7 @@ For an admin, the managed-settings entry is:
 {
   "channelsEnabled": true,
   "allowedChannelPlugins": [
-    { "marketplace": "carbonvoice", "plugin": "carbon-voice" }
+    { "marketplace": "carbonvoice", "plugin": "cv-channel" }
   ]
 }
 ```
@@ -110,15 +110,15 @@ The bare MCP server still works and is supported for one more release. Add it to
 }
 ```
 
-and start with `claude --dangerously-load-development-channels server:cv-claude-channel`. New installs should prefer the plugin — `/carbon-voice:configure` keeps your token out of `.mcp.json`, which usually gets committed.
+and start with `claude --dangerously-load-development-channels server:cv-claude-channel`. New installs should prefer the plugin — `/cv-channel:configure` keeps your token out of `.mcp.json`, which usually gets committed.
 
 ## Configuration
 
-The Personal Access Token is the only required setting. `/carbon-voice:configure` writes it to `~/.claude/channels/cv/.env` (mode 0600); an explicit `CV_PAT` in the environment takes precedence.
+The Personal Access Token is the only required setting. `/cv-channel:configure` writes it to `~/.claude/channels/cv/.env` (mode 0600); an explicit `CV_PAT` in the environment takes precedence.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `CV_PAT` | — | Personal Access Token. Required unless set via `/carbon-voice:configure`. |
+| `CV_PAT` | — | Personal Access Token. Required unless set via `/cv-channel:configure`. |
 | `CV_ENV_PATH` | `~/.claude/channels/cv/.env` | Where the token file lives |
 | `CV_CONVERSATION_ID` | all | Scope to a single conversation |
 | `CV_PROJECT_NAME` | `this project` | Project name shown to a newly allowed sender |
@@ -136,17 +136,17 @@ The Personal Access Token is the only required setting. `/carbon-voice:configure
 | `CV_REACTION_ID` | 👀 | Emoji used as the processed marker |
 | `CV_PERMISSION_ALLOW_REACTION` | ✅ | Emoji meaning "allow once" |
 | `CV_PERMISSION_ALLOW_ALWAYS_REACTION` | 💯 | Emoji meaning "allow for this session" |
-| `CV_PERMISSION_DENY_REACTION` | ⛔ | Emoji meaning "deny" |
+| `CV_PERMISSION_DENY_REACTION` | ⛔,👎 | Emoji meaning "deny" (both accepted) |
 | `CV_LOG_FILE` | stderr only | Mirror the log to a file |
 
-> These take a single emoji (any emoji, not just the curated set) or a legacy curated slug, which is normalized to its emoji. The four defaults are deliberately distinct, and the server warns at startup if the marker collides with an approval emoji or if a value is not a single emoji.
+> Each takes a comma-separated list of emoji — any emoji, not just the curated set — or a legacy curated slug, which is normalized to its emoji. Deny accepts two by default: ⛔ is what the app's one-tap quick row shows and what the legacy `negative` reaction normalizes to, while 👎 is the glyph the pre-migration UI drew for that same reaction, so both muscle memories work. The prompt names every glyph it accepts, and the server warns at startup if a value is not a single emoji, if two verdicts share a glyph, or if the processed marker collides with an approval emoji.
 
 ## Usage
 
 ### Receiving messages
 
 ```
-<channel source="plugin:carbon-voice:carbon-voice" channel_id="..." message_id="..." sender_id="..." is_reply="false" reply_to_id="...">
+<channel source="plugin:cv-channel:cv-channel" channel_id="..." message_id="..." sender_id="..." is_reply="false" reply_to_id="...">
   transcript of what was said
 </channel>
 ```
@@ -164,7 +164,7 @@ Claude wants to run Bash: Delete the build directory
 
 {"command":"rm -rf ./build"}
 
-✅ = allow once. 💯 = allow Bash for the rest of this session, whatever the arguments. ⛔ = deny.
+✅ = allow once. 💯 = allow Bash for the rest of this session, whatever the arguments. ⛔ or 👎 = deny.
 Or reply "yes abcde" or "no abcde".
 ```
 
@@ -180,14 +180,14 @@ A relayed prompt expires after `CV_PERMISSION_TTL_MS` and can no longer be answe
 
 **Every sender is denied by default.** Unauthorized messages are dropped silently.
 
-Access is managed from the terminal with `/carbon-voice:access`:
+Access is managed from the terminal with `/cv-channel:access`:
 
 ```
-/carbon-voice:access list
-/carbon-voice:access allow <user-id>
-/carbon-voice:access remove <user-id>
-/carbon-voice:access block <user-id>
-/carbon-voice:access unblock <user-id>
+/cv-channel:access list
+/cv-channel:access allow <user-id>
+/cv-channel:access remove <user-id>
+/cv-channel:access block <user-id>
+/cv-channel:access unblock <user-id>
 ```
 
 Allowlist changes are **only** made this way. The channel server reads
@@ -218,7 +218,7 @@ Test the plugin without publishing:
 
 ```bash
 npm run build
-claude --plugin-dir . --dangerously-load-development-channels plugin:carbon-voice@inline
+claude --plugin-dir . --dangerously-load-development-channels plugin:cv-channel@inline
 claude plugin validate . --strict
 ```
 

@@ -1,5 +1,5 @@
 {
-  "//": "Only needed if you are running the bare MCP server instead of the plugin. Installing the plugin supplies its own .mcp.json — see README.md. Prefer /carbon-voice:configure over putting CV_PAT here, since .mcp.json usually gets committed.",
+  "//": "Only needed if you are running the bare MCP server instead of the plugin. Installing the plugin supplies its own .mcp.json — see README.md. Prefer /cv-channel:configure over putting CV_PAT here, since .mcp.json usually gets committed.",
   "mcpServers": {
     "cv-claude-channel": {
       "command": "npx",

@@ -1,6 +1,6 @@
 {
   "mcpServers": {
-    "carbon-voice": {
+    "cv-channel": {
       "command": "node",
       "args": ["${CLAUDE_PLUGIN_ROOT}/dist/cv-claude-channel.js"]
     }

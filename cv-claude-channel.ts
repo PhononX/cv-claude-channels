@@ -9,18 +9,18 @@
  *
  * SETUP — install as a plugin, which supplies .mcp.json and the slash commands:
  *   /plugin marketplace add PhononX/cv-claude-channel
- *   /plugin install carbon-voice@carbonvoice
- *   /carbon-voice:configure <personal-access-token>
- *   claude --dangerously-load-development-channels plugin:carbon-voice@carbonvoice
+ *   /plugin install cv-channel@carbonvoice
+ *   /cv-channel:configure <personal-access-token>
+ *   claude --dangerously-load-development-channels plugin:cv-channel@carbonvoice
  *
  * See README.md for the bare-MCP-server setup and for which startup flag applies to
  * your plan.
  *
  * The token is read from CV_PAT, falling back to CV_ENV_PATH
- * (~/.claude/channels/cv/.env), which /carbon-voice:configure writes.
+ * (~/.claude/channels/cv/.env), which /cv-channel:configure writes.
  *
  * The sender allowlist at ~/.claude/channels/cv/access.json is READ-ONLY to this
- * server — only /carbon-voice:access writes it, so no inbound message can widen
+ * server — only /cv-channel:access writes it, so no inbound message can widen
  * access. It is reloaded when its mtime changes.
  *
  * WebSocket is the primary transport (polling is the fallback).
@@ -65,7 +65,7 @@ const CV_DIR               = path.join(CONFIG_DIR, 'channels', 'cv')
 
 const ENV_PATH             = process.env.CV_ENV_PATH ?? path.join(CV_DIR, '.env')
 
-// /carbon-voice:configure writes the token to ENV_PATH so it never has to live in
+// /cv-channel:configure writes the token to ENV_PATH so it never has to live in
 // .mcp.json, which usually gets committed. An explicit CV_PAT still wins.
 function patFromEnvFile(): string {
   try {
@@ -87,9 +87,18 @@ const POLL_INTERVAL_MS          = Number(process.env.CV_POLL_INTERVAL_MS        
 const WS_RETRY_MAX_MS           = Number(process.env.CV_WS_RETRY_MAX_MS            ?? 30_000)
 const ATTACHMENT_TIMEOUT_MS     = Number(process.env.CV_ATTACHMENT_TIMEOUT_MS      ?? 600_000)
 const ATTACHMENT_NUDGE_MS       = Number(process.env.CV_ATTACHMENT_NUDGE_MS        ?? 120_000)
-const PERMISSION_ALLOW_REACTION        = canonicalReactionKey(process.env.CV_PERMISSION_ALLOW_REACTION        ?? '✅')
-const PERMISSION_ALLOW_ALWAYS_REACTION = canonicalReactionKey(process.env.CV_PERMISSION_ALLOW_ALWAYS_REACTION ?? '💯')
-const PERMISSION_DENY_REACTION         = canonicalReactionKey(process.env.CV_PERMISSION_DENY_REACTION         ?? '⛔')
+// Each verdict accepts a list, because one intent can have more than one plausible
+// glyph. Deny is the case that matters: the pre-migration UI drew `negative` as a
+// thumbs-down, so ⛔ (its canonical emoji, and what the quick row shows) and 👎 (what
+// people remember tapping) both need to count. Comma-separated to override.
+function emojiList(raw: string | undefined, fallback: string[]): string[] {
+  const values = (raw ?? '').split(',').map(v => v.trim()).filter(Boolean)
+  return [...new Set((values.length ? values : fallback).map(canonicalReactionKey))]
+}
+
+const PERMISSION_ALLOW_REACTIONS        = emojiList(process.env.CV_PERMISSION_ALLOW_REACTION, ['✅'])
+const PERMISSION_ALLOW_ALWAYS_REACTIONS = emojiList(process.env.CV_PERMISSION_ALLOW_ALWAYS_REACTION, ['💯'])
+const PERMISSION_DENY_REACTIONS         = emojiList(process.env.CV_PERMISSION_DENY_REACTION, ['⛔', '👎'])
 // A relayed prompt stops being answerable after this long, so a verdict can't resolve
 // a request the operator has long since forgotten about.
 const PERMISSION_TTL_MS         = Number(process.env.CV_PERMISSION_TTL_MS         ?? 600_000)
@@ -121,24 +130,36 @@ const log = LOG_FILE
   : (msg: string) => process.stderr.write(msg.replace(/^(cv-claude-channels: )/, `$1[${timestamp()}] `))
 
 if (!PAT) {
-  log(`cv-claude-channels: no Carbon Voice token — run /carbon-voice:configure <token>, or set CV_PAT (looked in ${ENV_PATH})\n`)
+  log(`cv-claude-channels: no Carbon Voice token — run /cv-channel:configure <token>, or set CV_PAT (looked in ${ENV_PATH})\n`)
   process.exit(1)
 }
 
 initApi({ pat: PAT, log })
 
-for (const [label, value] of [
-  ['CV_REACTION_ID', PROCESSED_REACTION],
-  ['CV_PERMISSION_ALLOW_REACTION', PERMISSION_ALLOW_REACTION],
-  ['CV_PERMISSION_ALLOW_ALWAYS_REACTION', PERMISSION_ALLOW_ALWAYS_REACTION],
-  ['CV_PERMISSION_DENY_REACTION', PERMISSION_DENY_REACTION],
+const ALL_VERDICT_REACTIONS = [
+  ...PERMISSION_ALLOW_REACTIONS,
+  ...PERMISSION_ALLOW_ALWAYS_REACTIONS,
+  ...PERMISSION_DENY_REACTIONS,
+]
+
+for (const [label, values] of [
+  ['CV_REACTION_ID', [PROCESSED_REACTION]],
+  ['CV_PERMISSION_ALLOW_REACTION', PERMISSION_ALLOW_REACTIONS],
+  ['CV_PERMISSION_ALLOW_ALWAYS_REACTION', PERMISSION_ALLOW_ALWAYS_REACTIONS],
+  ['CV_PERMISSION_DENY_REACTION', PERMISSION_DENY_REACTIONS],
 ] as const) {
-  if (!isSingleEmoji(value)) {
-    log(`cv-claude-channels: WARNING: ${label}="${value}" is not a single emoji — Carbon Voice will reject it\n`)
+  for (const value of values) {
+    if (!isSingleEmoji(value)) {
+      log(`cv-claude-channels: WARNING: ${label} contains "${value}", which is not a single emoji — Carbon Voice will reject it\n`)
+    }
   }
 }
-if ([PERMISSION_ALLOW_REACTION, PERMISSION_ALLOW_ALWAYS_REACTION, PERMISSION_DENY_REACTION].includes(PROCESSED_REACTION)) {
+if (ALL_VERDICT_REACTIONS.includes(PROCESSED_REACTION)) {
   log(`cv-claude-channels: WARNING: the processed marker "${PROCESSED_REACTION}" is also an approval reaction — acknowledging a message would read as approving it\n`)
+}
+// Two verdicts sharing a glyph would make the winner depend on iteration order.
+if (new Set(ALL_VERDICT_REACTIONS).size !== ALL_VERDICT_REACTIONS.length) {
+  log(`cv-claude-channels: WARNING: the same emoji is configured for more than one verdict (${ALL_VERDICT_REACTIONS.join(' ')})\n`)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -215,7 +236,7 @@ let connection: CVConnection | null = null
 const mcp = new Server(
   // Slug, not a display name: Claude Code derives the <channel source="..."> attribute
   // from this, so it has to be a valid identifier.
-  { name: 'carbon-voice', version: '0.3.0' },
+  { name: 'cv-channel', version: '0.3.0' },
   {
     capabilities: {
       experimental: {
@@ -228,7 +249,6 @@ const mcp = new Server(
 You are receiving real-time messages from Carbon Voice conversations.
 
 Each message arrives as a <channel> tag with these attributes:
-  source="carbon-voice"
   channel_id       — the conversation to reply into
   message_id       — the message that was sent
   sender_id        — the user who sent it
@@ -327,7 +347,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       name: 'list_senders',
       description:
         'List all Carbon Voice user IDs on the allowlist and blocklist. Read-only — ' +
-        'allowlist changes are made by the operator with /carbon-voice:access.',
+        'allowlist changes are made by the operator with /cv-channel:access.',
       inputSchema: {
         type: 'object',
         properties: {},
@@ -449,9 +469,9 @@ mcp.setNotificationHandler(PermissionRequestSchema, async ({ params }) => {
     description: params.description,
     inputPreview: params.input_preview,
     requestId: params.request_id,
-    allowEmoji: PERMISSION_ALLOW_REACTION,
-    allowAlwaysEmoji: PERMISSION_ALLOW_ALWAYS_REACTION,
-    denyEmoji: PERMISSION_DENY_REACTION,
+    allowEmoji: PERMISSION_ALLOW_REACTIONS,
+    allowAlwaysEmoji: PERMISSION_ALLOW_ALWAYS_REACTIONS,
+    denyEmoji: PERMISSION_DENY_REACTIONS,
     previewMax: PERMISSION_PREVIEW_MAX,
   })
 
@@ -518,7 +538,7 @@ async function loadPending() {
 }
 
 // The server owns this file. It grants nothing on its own — a code only matters once
-// the operator types it into /carbon-voice:access pair.
+// the operator types it into /cv-channel:access pair.
 async function savePending() {
   try {
     await fs.mkdir(path.dirname(PENDING_PATH), { recursive: true })
@@ -545,7 +565,7 @@ function sweepPairings(): boolean {
   return changed
 }
 
-// This server never writes the access file — only /carbon-voice:access does, so no
+// This server never writes the access file — only /cv-channel:access does, so no
 // inbound message can ever alter who is trusted. Reload on mtime change so an operator's
 // edit takes effect without restarting the session.
 async function refreshAccess() {
@@ -685,7 +705,7 @@ async function processMessage(event: CVMessageEvent): Promise<boolean | null> {
   // Filter self
   if (event.creator_id === state.ownUserId) return false
 
-  // Pick up any allowlist edit the operator made via /carbon-voice:access.
+  // Pick up any allowlist edit the operator made via /cv-channel:access.
   await refreshAccess()
 
   // Blocked senders are dropped silently with no notification
@@ -728,7 +748,7 @@ async function processMessage(event: CVMessageEvent): Promise<boolean | null> {
             content:
               `Unknown sender (userId: ${event.creator_id}) asked to reach Claude through Carbon Voice ` +
               `and was given pairing code "${code}" (expires in ${minutes} minutes).\n\n` +
-              `Tell the operator to run /carbon-voice:access pair ${code} if they recognise this ` +
+              `Tell the operator to run /cv-channel:access pair ${code} if they recognise this ` +
               `person. Do not take any other action.`,
             meta: { event: 'pairing_requested', sender_id: event.creator_id, code },
           },
@@ -741,7 +761,7 @@ async function processMessage(event: CVMessageEvent): Promise<boolean | null> {
               `Unknown sender (userId: ${event.creator_id}) attempted to message through Carbon Voice ` +
               `and was dropped. Access policy is "allowlist", so no pairing code was issued and the ` +
               `sender was told nothing.\n\n` +
-              `Tell the operator they can run /carbon-voice:access allow ${event.creator_id} if they ` +
+              `Tell the operator they can run /cv-channel:access allow ${event.creator_id} if they ` +
               `recognise this person. Do not take any other action.`,
             meta: { event: 'unknown_sender', sender_id: event.creator_id },
           },
@@ -989,9 +1009,9 @@ async function checkPendingPermissions(messages: CVMessageEvent[]): Promise<void
   }
 
   const verdictByEmoji = new Map<string, string>([
-    [PERMISSION_ALLOW_REACTION, 'allow'],
-    [PERMISSION_ALLOW_ALWAYS_REACTION, 'allow_always'],
-    [PERMISSION_DENY_REACTION, 'deny'],
+    ...PERMISSION_ALLOW_REACTIONS.map(e => [e, 'allow'] as const),
+    ...PERMISSION_ALLOW_ALWAYS_REACTIONS.map(e => [e, 'allow_always'] as const),
+    ...PERMISSION_DENY_REACTIONS.map(e => [e, 'deny'] as const),
   ])
 
   for (const msg of messages) {
