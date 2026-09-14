@@ -3,9 +3,11 @@ import * as os from 'node:os'
 import * as fs from 'node:fs/promises'
 import * as path from 'node:path'
 import {
+  init,
   attachmentFromString,
   resolveActualPath,
   resolveAttachmentUrls,
+  sendSignal,
   type CVAttachment,
   type FileAttachment,
   type LinkAttachment,
@@ -229,5 +231,54 @@ describe('resolveAttachmentUrls', () => {
   it('throws when the bulk signed-URL API returns a non-ok response', async () => {
     mockFetch.mockResolvedValueOnce({ ok: false, status: 403 })
     await expect(resolveAttachmentUrls([att()])).rejects.toThrow('403')
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// sendSignal
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('sendSignal', () => {
+  const mockFetch = vi.fn()
+
+  beforeEach(() => {
+    vi.stubGlobal('fetch', mockFetch)
+    init({ pat: 'cv_pat_test', log: () => {} })
+    mockFetch.mockResolvedValue({ ok: true, status: 204 })
+  })
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+    mockFetch.mockReset()
+  })
+
+  function lastCall() {
+    const [url, fetchInit] = mockFetch.mock.calls.at(-1)!
+    return { url, init: fetchInit, body: JSON.parse(fetchInit.body) }
+  }
+
+  it('POSTs to the conversation signal endpoint with a Bearer PAT', async () => {
+    await sendSignal({ conversationId: 'conv-1', signalType: 'thinking' })
+    const { url, init: fetchInit } = lastCall()
+    expect(url).toBe('https://api.carbonvoice.app/v5/conversations/conv-1/signal')
+    expect(fetchInit.method).toBe('POST')
+    expect(fetchInit.headers.Authorization).toBe('Bearer cv_pat_test')
+  })
+
+  it('sends signal_type and passes ttl_ms / message_id through', async () => {
+    await sendSignal({ conversationId: 'conv-1', signalType: 'tool_call', body: 'Bash', ttlMs: 4000, messageId: 'msg-9' })
+    const { body } = lastCall()
+    expect(body).toMatchObject({ signal_type: 'tool_call', body: 'Bash', ttl_ms: 4000, message_id: 'msg-9' })
+  })
+
+  it('truncates body to the 200-char server limit', async () => {
+    await sendSignal({ conversationId: 'conv-1', signalType: 'thinking', body: 'x'.repeat(250) })
+    const { body } = lastCall()
+    expect(body.body).toHaveLength(200)
+  })
+
+  it('is best-effort: does not throw on a non-ok response', async () => {
+    mockFetch.mockResolvedValueOnce({ ok: false, status: 429 })
+    await expect(sendSignal({ conversationId: 'conv-1', signalType: 'thinking' })).resolves.toBeUndefined()
   })
 })
