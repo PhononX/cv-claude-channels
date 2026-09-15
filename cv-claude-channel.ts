@@ -438,11 +438,17 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 // server-side TTL, we re-POST on an interval while a conversation is "in flight",
 // and cap the duration so a turn that ends without a reply can't leave it stuck on.
 
-const SIGNAL_BEAT_MS = 1_500     // re-post cadence (contract: every 1-2s)
-const SIGNAL_TTL_MS  = 4_000     // client-side expiry hint if heartbeats stop
-const SIGNAL_MAX_MS  = 180_000   // safety cap: auto-clear after 3m with no reply
+const SIGNAL_BEAT_MS     = 1_500   // re-post cadence (contract: every 1-2s)
+const SIGNAL_TTL_MS      = 4_000   // client-side expiry hint while heartbeating
+const SIGNAL_STOP_TTL_MS = 500     // ttl on the final "clear" beat (server min)
+const SIGNAL_MAX_MS      = 180_000 // safety cap: auto-clear after 3m with no reply
 
-const signalBeats = new Map<string, { beat: ReturnType<typeof setInterval>; cap: ReturnType<typeof setTimeout> }>()
+const signalBeats = new Map<string, {
+  beat: ReturnType<typeof setInterval>
+  cap: ReturnType<typeof setTimeout>
+  signalType: SignalType
+  body?: string
+}>()
 
 function startSignal(channelId: string, signalType: SignalType, body?: string): void {
   stopSignal(channelId)
@@ -452,7 +458,7 @@ function startSignal(channelId: string, signalType: SignalType, body?: string): 
   const cap = setTimeout(() => stopSignal(channelId), SIGNAL_MAX_MS)
   beat.unref?.()
   cap.unref?.()
-  signalBeats.set(channelId, { beat, cap })
+  signalBeats.set(channelId, { beat, cap, signalType, body })
 }
 
 function stopSignal(channelId: string): void {
@@ -461,6 +467,11 @@ function stopSignal(channelId: string): void {
   clearInterval(entry.beat)
   clearTimeout(entry.cap)
   signalBeats.delete(channelId)
+  // The endpoint has no explicit "clear" — a client keeps the indicator alive
+  // for the last signal's ttl_ms. Send one final beat of the same type with the
+  // minimum ttl so the indicator clears in ~0.5s after the reply instead of
+  // lingering out the full SIGNAL_TTL_MS window.
+  sendSignal({ conversationId: channelId, signalType: entry.signalType, body: entry.body, ttlMs: SIGNAL_STOP_TTL_MS }).catch(() => {})
 }
 
 function stopAllSignals(): void {
