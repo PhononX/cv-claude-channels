@@ -43,10 +43,11 @@ import {
   whoami, addReaction, markRead,
   sendMessage, getRecentMessages, getShareLink, attachmentFromString,
   downloadAttachmentsToDir, downloadShareLinkAttachmentsToDir,
-  createConnection,
+  createConnection, sendSignal,
   type CVConnection,
   type CVMessageEvent,
   type CVAttachment,
+  type SignalType,
 } from './cv-api.js'
 import {
   formatPermissionPrompt, parseVerdict, findOpenRequest, sweepExpired,
@@ -385,6 +386,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       attachments: attachments?.map(attachmentFromString),
     })
 
+    // Claude produced a reply — the message itself replaces the indicator, so stop
+    // heartbeating any activity signal for this conversation.
+    stopSignal(channel_id)
+
     return {
       content: [{ type: 'text', text: `sent: ${sent_id}` }],
     }
@@ -410,6 +415,54 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
   throw new Error(`Unknown tool: ${req.params.name}`)
 })
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ACTIVITY SIGNALS: heartbeat an ephemeral "thinking"/"tool_call" state to CV
+// ─────────────────────────────────────────────────────────────────────────────
+// This MCP server can't see Claude's think/tool loop directly — it observes three
+// edges: handing a message to Claude (→ thinking), a permission request for a gated
+// tool (→ tool_call), and send_message (→ stop). The signal has no server-side TTL,
+// so we re-POST on an interval while a conversation is "in flight", and cap the
+// duration so a turn that ends without a reply can't leave it stuck on.
+
+const SIGNAL_BEAT_MS     = 1_500   // re-post cadence (contract: every 1-2s)
+const SIGNAL_TTL_MS      = 4_000   // client-side expiry hint while heartbeating
+const SIGNAL_STOP_TTL_MS = 500     // ttl on the final "clear" beat (server min)
+const SIGNAL_MAX_MS      = 180_000 // safety cap: auto-clear after 3m with no reply
+
+const signalBeats = new Map<string, {
+  beat: ReturnType<typeof setInterval>
+  cap: ReturnType<typeof setTimeout>
+  signalType: SignalType
+  body?: string
+}>()
+
+function startSignal(channelId: string, signalType: SignalType, body?: string): void {
+  stopSignal(channelId)
+  const tick = () => { sendSignal({ conversationId: channelId, signalType, body, ttlMs: SIGNAL_TTL_MS }).catch(() => {}) }
+  tick()
+  const beat = setInterval(tick, SIGNAL_BEAT_MS)
+  const cap = setTimeout(() => stopSignal(channelId), SIGNAL_MAX_MS)
+  beat.unref?.()
+  cap.unref?.()
+  signalBeats.set(channelId, { beat, cap, signalType, body })
+}
+
+function stopSignal(channelId: string): void {
+  const entry = signalBeats.get(channelId)
+  if (!entry) return
+  clearInterval(entry.beat)
+  clearTimeout(entry.cap)
+  signalBeats.delete(channelId)
+  // The endpoint has no explicit "clear" — a client keeps the indicator alive for the
+  // last signal's ttl_ms. Send one final beat of the same type with the minimum ttl so
+  // the dot clears in ~0.5s after the reply instead of coasting out the full window.
+  sendSignal({ conversationId: channelId, signalType: entry.signalType, body: entry.body, ttlMs: SIGNAL_STOP_TTL_MS }).catch(() => {})
+}
+
+function stopAllSignals(): void {
+  for (const channelId of [...signalBeats.keys()]) stopSignal(channelId)
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // PERMISSION RELAY: forward Claude Code permission prompts to CV
@@ -439,6 +492,8 @@ mcp.setNotificationHandler(PermissionRequestSchema, async ({ params }) => {
   // Auto-approve tools the user has already said "always allow" to this session
   if (state.allowAlwaysTools.has(params.tool_name)) {
     log(`cv-claude-channels: auto-approving ${params.tool_name} (allow_always in session)\n`)
+    // Tool runs without a prompt — still surface the tool_call activity.
+    if (state.lastCVContext) startSignal(state.lastCVContext.channelId, 'tool_call', params.tool_name)
     try {
       await mcp.notification({
         method: 'notifications/claude/channel/permission',
@@ -487,6 +542,8 @@ mcp.setNotificationHandler(PermissionRequestSchema, async ({ params }) => {
       toolName: params.tool_name,
       expiresAt: Date.now() + PERMISSION_TTL_MS,
     })
+    // Reflect the tool_call phase while the user decides and the tool runs.
+    startSignal(ctx.channelId, 'tool_call', params.tool_name)
     log(`cv-claude-channels: permission request for ${params.tool_name} relayed to CV (request_id=${params.request_id} cvMessageId=${cvMessageId})\n`)
   } catch (err) {
     log(`cv-claude-channels: permission relay send failed for ${params.request_id}: ${err}\n`)
@@ -952,6 +1009,9 @@ async function processMessage(event: CVMessageEvent): Promise<boolean | null> {
       },
     })
     state.lastCVContext = { channelId: channel_id, replyToId: reply_to_id, at: Date.now() }
+    // Claude is now working on this message — heartbeat a "thinking" indicator into
+    // the conversation until it replies (send_message) or the cap expires.
+    startSignal(channel_id, 'thinking')
     // Mark messages whose attachments were fully delivered inline so the follow-up
     // scanner doesn't re-send them.
     if (localPaths.size > 0 && !hasPendingUploads) {
@@ -1307,6 +1367,7 @@ async function fetchMissedMessagesOnce() {
 async function shutdown(signal: string) {
   log(`cv-claude-channels: ${signal} received, shutting down\n`)
   connection?.disconnect()
+  stopAllSignals()
 
   if (state.flushTimer)  clearTimeout(state.flushTimer)
 
