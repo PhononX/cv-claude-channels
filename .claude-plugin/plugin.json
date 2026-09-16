@@ -1,0 +1,12 @@
+{
+  "name": "cv-channel",
+  "description": "Carbon Voice channel for Claude Code — send voice messages into a running session and get spoken replies back, with remote tool-approval relay. Manage access with /cv-channel:access.",
+  "version": "0.3.0",
+  "author": {
+    "name": "PhononX"
+  },
+  "homepage": "https://github.com/PhononX/cv-claude-channel#readme",
+  "repository": "https://github.com/PhononX/cv-claude-channel",
+  "license": "MIT",
+  "keywords": ["carbon-voice", "voice", "audio", "messaging", "channel", "mcp"]
+}

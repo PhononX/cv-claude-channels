@@ -1,6 +1,5 @@
 node_modules/
 .mcp.json.local
 .claude/
-.mcp.json
 dist/
 *.log

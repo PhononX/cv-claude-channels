@@ -21,7 +21,10 @@ export interface CVTimecode { t: string; s: number; e: number }
 
 export interface CVReactionSummary {
   reaction_counts: Record<string, number>
+  // Legacy shape: one entry per user/reaction pair, identifier may be a curated slug.
   top_user_reactions: Array<{ user_id: string; reaction_id: string }>
+  // Emoji-native shape added by the CV-13479 contract split, grouped per reaction.
+  top_user_emojis?: Array<{ reaction: string; count: number; user_ids: string[] }>
 }
 
 export interface CVAttachment {
@@ -71,14 +74,6 @@ export interface CVShareLink {
   revoked_at?: string | null
   has_channel_access?: boolean
   shared_message?: CVSharedMessage
-}
-
-export interface Reaction {
-  id: string
-  name: string
-  code: string
-  reaction_tts: string
-  image_url: string
 }
 
 export interface LinkAttachment {
@@ -140,19 +135,10 @@ export async function whoami(): Promise<string> {
 // REACTIONS
 // ─────────────────────────────────────────────────────────────────────────────
 
-export async function getReactions(): Promise<Reaction[]> {
-  const res = await cvFetch('GET', '/reactions')
-  if (!res.ok) {
-    _log(`cv-claude-channels: GET /reactions failed ${res.status}\n`)
-    return []
-  }
-  const data = await res.json() as Reaction[]
-  return Array.isArray(data) ? data : []
-}
 
-export async function addReaction(reactionId: string, messageId: string): Promise<void> {
-  _log(`cv-claude-channels: addReaction ${reactionId} on ${messageId}\n`)
-  const res = await cvFetch('POST', `/reactions/${reactionId}/${messageId}`)
+export async function addReaction(reaction: string, messageId: string): Promise<void> {
+  _log(`cv-claude-channels: addReaction ${reaction} on ${messageId}\n`)
+  const res = await cvFetch('POST', `/reactions/message/${messageId}`, { reaction })
   if (!res.ok) {
     _log(`cv-claude-channels: addReaction failed ${res.status} for ${messageId}\n`)
   }
@@ -300,6 +286,35 @@ export async function getShareLink(shareLinkId: string): Promise<CVShareLink | n
     return null
   }
   return res.json() as Promise<CVShareLink>
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ACTIVITY SIGNALS
+// ─────────────────────────────────────────────────────────────────────────────
+
+// POST /v5/conversations/:id/signal broadcasts an ephemeral activity indicator to
+// clients who have the conversation open. Stateless server-side: a signal must be
+// re-sent every ~1-2s to stay visible and simply stops being sent to clear it.
+// ttl_ms is a client-side expiry hint; is_agent is stamped server-side from the PAT.
+export type SignalType = 'typing' | 'thinking' | 'tool_call' | 'searching' | 'processing'
+
+export async function sendSignal(params: {
+  conversationId: string
+  signalType: SignalType
+  body?: string
+  ttlMs?: number
+  messageId?: string
+}): Promise<void> {
+  const res = await cvFetch('POST', `/v5/conversations/${params.conversationId}/signal`, {
+    signal_type: params.signalType,
+    body: params.body?.slice(0, 200),
+    ttl_ms: params.ttlMs,
+    message_id: params.messageId,
+  })
+  // Best-effort: a dropped signal just means a missed heartbeat, never fatal.
+  if (!res.ok) {
+    _log(`cv-claude-channels: signal ${params.signalType} → ${res.status} (${params.conversationId})\n`)
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

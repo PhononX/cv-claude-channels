@@ -2,142 +2,263 @@
 
 ## What This Is
 
-An MCP server that bridges **Carbon Voice conversations into Claude Code sessions**. When someone sends a voice message in Carbon Voice, Claude receives it in real-time and can reply back with text-to-speech. Also relays permission prompts so you can approve dangerous tool operations (Bash, Write, Edit) from anywhere via Carbon Voice.
+An MCP channel server that bridges **Carbon Voice conversations into Claude Code sessions**. When someone sends a voice message in Carbon Voice, Claude receives it in real-time and can reply back with text-to-speech. Also relays permission prompts so you can approve dangerous tool operations (Bash, Write, Edit) from anywhere via Carbon Voice.
 
-Published as `@carbonvoice/cv-claude-channel` on npm.
+Published as `@carbonvoice/cv-claude-channel` on npm, and installable as the `cv-channel` plugin from the `carbonvoice` marketplace (the npm tarball *is* the plugin).
 
 ## Key Architecture
 
 ### Message Flow
 1. **Inbound**: Messages arrive from Carbon Voice via WebSocket (primary) or polling (fallback).
-2. **Deduplication**: In-memory cache with TTL (default 5m) prevents duplicate processing.
-3. **Sender gating**: Allowlist-by-default — unknown senders trigger a notification for you to allow.
-4. **Claude receives**: As a `<channel>` tag with `source="carbon-voice"`, `channel_id`, `sender_id`, `message_id`, `reply_to_id`.
-5. **Claude replies**: Calls `send_message` tool with channel_id, reply_to_message_id, and text. CV auto-converts to audio.
+2. **Deduplication**: Server-side reaction marker plus an in-memory cursor prevent duplicate processing.
+3. **Sender gating**: Deny-by-default allowlist. Under `dmPolicy: "pairing"` an unknown sender is replied to in CV with a 6-character code and the operator runs `/cv-channel:access pair <code>`; under `"allowlist"` they are dropped silently. Either way Claude is notified once per sender, and only the *operator* can act.
+4. **Claude receives**: As a `<channel>` tag with `channel_id`, `sender_id`, `message_id`, `reply_to_id`. The `source` attribute is set by Claude Code from the server name — do not set `source` in `meta`.
+5. **Claude replies**: Calls `send_message` with channel_id, reply_to_message_id, and text. CV auto-converts to audio.
 
 ### Permission Relay
-When Claude needs approval for dangerous tools:
-1. Permission request arrives as a notification.
-2. **CV-13261 addition**: Now builds a `cv_agent_ui` permission card (Flutter interactive UI) and attaches it to the permission message.
-3. User reacts or types approval in Carbon Voice.
-4. Reaction ID is polled to complete the permission check.
-5. Falls back to text (`yes`/`no`) if card fails or reaction IDs are unavailable.
+1. Claude Code sends `notifications/claude/channel/permission_request` with `request_id`, `tool_name`, `description`, `input_preview`.
+2. We format a prompt (`permission-relay.ts`) that includes **`input_preview`**, not just `description` — for Bash the description is often the bare constant `Run shell command`.
+3. The prompt goes to the conversation that most recently spoke, provided that context is fresher than `CV_PERMISSION_CONTEXT_TTL_MS`.
+4. The user reacts (✅ / 💯 / ⛔ or 👎) or replies `yes <id>` / `no <id>`.
+5. We emit `notifications/claude/channel/permission` with `behavior: 'allow' | 'deny'`.
+
+Only `allow` and `deny` exist on the wire. "Allow always" is ours: it adds the tool name to a session-only set (`state.allowAlwaysTools`) and sends `allow`.
 
 ### State Persistence
-- **Cursor**: Last-seen message timestamp saved to disk (`~/.claude/channels/cv/state.json`).
-- **Allowlist**: Sender allowlist/blocklist persisted to disk, survives restarts.
-- **Dedup cache**: In-memory only, clears on restart (intentional — errors are rare and bouncing is low-cost).
+- **Cursor**: Last-checked timestamp on disk (`<config>/channels/cv/state.json`), debounced 5s.
+- **Allowlist**: `<config>/channels/cv/access.json`. **Read-only to this server** — see below.
+- **Pairing codes**: `<config>/channels/cv/pending.json`. **Server-owned**, read by the skill.
+- **Token**: `<config>/channels/cv/.env`, written by `/cv-channel:configure`.
+- **Pending permissions**: In-memory, with a TTL sweep.
 
-## Current Work (CV-13261)
+`<config>` is `CLAUDE_CONFIG_DIR` if set, else `~/.claude`. Server and skills
+resolve it identically; individual files can be overridden with `CV_ACCESS_PATH`,
+`CV_PENDING_PATH`, `CV_STATE_PATH`, `CV_ENV_PATH`, `CV_ATTACHMENTS_DIR`.
 
-**Branch**: `CV-13261-agent-ui-permission-attachment`
+## Security Model
 
-**Goal**: Attach an interactive permission-card to permission prompts so users can tap approve/deny in Carbon Voice instead of typing `yes abcde`.
+Three invariants worth not breaking:
 
-**Changes**:
-- Extracted `buildPermissionUiAttachment()` function into dedicated `permission-ui.ts` module (was inline in `cv-claude-channel.ts`).
-- Moved `AGENT_UI_MIME` constant to the same module.
-- Added `permission-ui.test.ts` for the UI builder.
-- `cv-claude-channel.ts` now imports the function and passes reaction IDs resolved from pending permissions.
+1. **The server never writes the allowlist.** There is no MCP tool that can add a sender. Only `/cv-channel:access` (a user-invocable skill that refuses channel-originated requests) writes `access.json`; the server reloads it on mtime change. This exists because inbound transcripts, forwarded messages, and attachment contents all reach Claude unfenced — if a tool could widen access, one crafted message could escalate. And allowlist membership is what authorizes permission approval.
+2. **The server ignores its own reactions** when resolving permission verdicts, so its processed-marker reaction can never read as an approval.
+3. **Pairing codes are a request, not a grant.** The server writes `pending.json`
+   but never `access.json`, so issuing a code cannot widen access — only the
+   operator typing `pair <code>` does. This split is why pairing does not
+   weaken invariant 1.
 
-**Status**: Refactor complete, tests added, awaiting review/testing.
+`dmPolicy` migration: a fresh install (no `access.json`) defaults to `pairing`
+so the first sender can be captured. An **existing** file with no `dmPolicy`
+migrates to `allowlist` — upgrading must never open a door the operator did not
+ask for.
+
+If you add a tool, ask whether an inbound message could talk Claude into calling it.
 
 ## Development Setup
 
 ```bash
 npm install
-npm start              # Run locally (requires CV_PAT env var)
-npm run build          # Compile TypeScript
-npm test               # Run vitest
-npm test:watch        # Watch mode
+npm start              # run against the TS source (requires a token)
+npm run build          # compile to dist/
+npm test               # vitest
+npm run test:watch     # watch mode
 ```
 
+### The reliable dev loop: the bare server
+
+Put the entry in **user-level `~/.claude.json`** with an absolute path (not the
+project `.mcp.json`, which is now the plugin's own file):
+
+```json
+{ "mcpServers": { "cv-claude-channel": {
+  "command": "npx",
+  "args": ["tsx", "/abs/path/to/cv-claude-channels/cv-claude-channel.ts"],
+  "env": { "CV_PAT": "..." }
+} } }
+```
+
+```bash
+claude --dangerously-load-development-channels server:cv-claude-channel
+```
+
+No build, no marketplace, and it exercises every server behavior.
+
+### Loading the plugin itself — unresolved
+
+```bash
+npm run build                      # the plugin's .mcp.json runs dist/
+claude plugin validate . --strict  # this works
+```
+
+`claude --plugin-dir . plugin list --json` reports the id as
+`cv-channel@inline`, but passing `plugin:cv-channel@inline` to
+`--dangerously-load-development-channels` was **reported failing** with "plugin
+not installed", and `@carbonvoice` only resolves once the npm package is
+published. The dev flag may not accept a session-scoped plugin from the
+synthetic `inline` marketplace at all. Until this is settled, use the bare
+server above.
+
+### How plugin dependencies actually get installed
+
+Claude Code copies a plugin into `~/.claude/plugins/cache/...` and installs its
+dependencies there before MCP servers launch — but **only if the plugin root
+contains a supported lockfile**. It runs `npm ci --ignore-scripts` (or
+`bun install --frozen-lockfile --ignore-scripts`), with a 60-second timeout.
+`yarn.lock` and `pnpm-lock.yaml` are deliberately skipped.
+
+**npm excludes `package-lock.json` from published tarballs**, so an npm-source
+plugin must ship `npm-shrinkwrap.json` — and, because this package uses a `files`
+allowlist, that filename has to be listed there too. Miss either half and the
+dependency install is skipped **silently, with no log entry**, and every user
+gets `ERR_MODULE_NOT_FOUND` on first run.
+
+So: regenerate the lockfile with `npm shrinkwrap` (never `package-lock.json`)
+whenever dependencies change, and keep `npm-shrinkwrap.json` in `files`.
+
+Verified end to end by unpacking the tarball and running the real command:
+`npm ci --ignore-scripts` completes in ~4s and the server starts from the
+unpacked copy.
+
+Two consequences worth knowing:
+- `--ignore-scripts` means a dependency needing a native build step will not
+  compile. All current deps are pure JS.
+- Plain `npm ci` installs devDependencies too, so the cache copy is ~92MB. Well
+  inside the 60s budget today, but keep devDependencies lean.
+
+Because dependencies are installed for us, **do not bundle**. Bundling would
+solve a problem the host already handles, at the cost of a 900KB artifact and
+worse stack traces.
+
+Still open: `dist/` is gitignored, so a **git**-sourced install has no compiled
+output. Only the npm source is supported.
+
 ### Environment Variables
-- `CV_PAT` (required): Personal Access Token from Carbon Voice.
-- `CV_API_BASE` (optional): Override API endpoint (default: `https://api.carbonvoice.app`). Useful for local testing.
-- `CV_CONVERSATION_ID` (optional): Filter to a specific conversation.
-- `CV_REACTION_ID` (optional): Auto-add reaction on message receipt.
-- `CV_SEEN_TTL_MS` (optional): Dedup TTL, milliseconds (default: 300000 = 5 min).
-- `CV_POLL_INTERVAL_MS` (optional): Polling interval, milliseconds (default: 5000).
-- `CV_WS_RETRY_MAX_MS` (optional): Max WebSocket backoff, milliseconds (default: 30000).
-- `CV_STATE_PATH` (optional): Path to state file (default: `~/.claude/channels/cv/state.json`).
+
+`CV_PAT` is the only required setting, and `/cv-channel:configure` can supply it instead. See the table in `README.md` for the full list — it is the canonical reference. Notable ones when working on the permission relay:
+
+- `CV_PERMISSION_TTL_MS` (600000): how long a relayed prompt stays answerable.
+- `CV_PERMISSION_CONTEXT_TTL_MS` (600000): how stale the target conversation may be before we decline to relay at all.
+- `CV_PERMISSION_PREVIEW_MAX` (400): characters of `input_preview` included, trimmed for playback.
+- `CV_LOG_FILE`: mirror stderr to a file. Essential for debugging the relay.
 
 ## Code Layout
 
 - **cv-claude-channel.ts** (main): MCP server setup, message loop, permission relay, sender gating, state persistence.
-- **permission-ui.ts**: Builds the `cv_agent_ui` permission-card payload (JSON with actions, metadata).
-- **permission-ui.test.ts**: Tests the card builder.
-- **cv-api.ts**: CV API client wrapper (types, auth, message/permission endpoints).
-- **package.json**: Node.js target: >= 18.0.0. Type: module (ES modules).
+- **permission-relay.ts**: pure helpers — verdict parsing, prompt formatting, pending-request bookkeeping. Extracted so it is testable without booting the server.
+- **permission-relay.test.ts**: tests for the above.
+- **cv-api.ts** / **cv-api.test.ts**: CV API client wrapper.
+- **.claude-plugin/plugin.json**: plugin manifest.
+- **.claude-plugin/marketplace.json**: marketplace catalog; points at the npm package.
+- **.mcp.json**: plugin-supplied server config. **Committed** — `--plugin-dir .` and `claude plugin validate` both need it, and the npm tarball is the plugin. Because the plugin root is also the repo root, opening this repo in Claude Code will offer it as a *project* MCP server, where `${CLAUDE_PLUGIN_ROOT}` doesn't expand and the entry fails. Decline it; use `--plugin-dir .` to test the real thing. Claude Code does **not** read `.mcp.json.local` — for a bare-server dev loop put the entry in user-level `~/.claude.json` with an absolute path instead. **Upgrading from before 0.2.0: back up your local `.mcp.json` first.** It used to be gitignored, and git silently overwrites an ignored file when a commit starts tracking it — pulling will destroy your dev config with no warning or conflict.
+- **skills/access/SKILL.md**: `/cv-channel:access`.
+- **skills/configure/SKILL.md**: `/cv-channel:configure`.
+- **package.json**: Node >= 18, ESM. The `files` allowlist controls the tarball; there is deliberately no `.npmignore`.
+
+`tsconfig.json` only lists `cv-claude-channel.ts` in `include` — everything else is pulled in transitively. Test files are not typechecked by `tsc`; run `npx tsc --noEmit` to check the server.
 
 ## Key Concepts
 
-### Reaction IDs
-The permission card uses **reaction IDs** to round-trip the user's decision (allow, allow-always, deny) back to Claude without extra server machinery. Each action in the card carries the reaction ID that corresponds to its meaning. User taps button → adds reaction → we poll for it → check its existence.
+### Reactions are emoji
+
+Since Carbon Voice's full-emoji migration (CV-13453) reactions are plain unicode
+emoji. This server does **not** call `GET /reactions` — that endpoint survives only
+for old app versions (CV-13516) — so there is no catalog fetch, no name/code→id
+resolution, and nothing about reactions that has to wait for `confirm_channels`.
+
+`reactions.ts` owns three things:
+
+- `CURATED_SLUG_TO_EMOJI` — the frozen legacy catalog. **Must mirror cv-api's
+  `CURATED_EMOJI_BY_REACTION_ID`** and carbon-voice-flutter's
+  `CuratedReactions.slugToEmoji`; divergence silently splits one reaction in two.
+- `collectReactors()` — the CV-13479 contract split means a summary can carry
+  `top_user_reactions` (legacy, per-user pairs, possibly slugs) and
+  `top_user_emojis` (emoji-native, grouped with `user_ids`) **at the same time**.
+  This flattens both onto canonical-emoji → reactors, so callers never care which
+  shape a reaction arrived in.
+- `isSingleEmoji()` — mirrors the cv-api validator, so we never send what the
+  server rejects. Checked at startup against every configured reaction.
+
+Writes go to the body-based endpoint `POST /reactions/message/:id` with
+`{"reaction": ...}`, which accepts a curated id or any single emoji. The old
+path-based route cannot carry emoji at all.
+
+Each verdict accepts a **list** of emoji, because one intent can have more than one
+plausible glyph. Defaults: 👀 marker, ✅ allow, 💯 allow-always, and **both ⛔ and 👎**
+for deny — ⛔ is the canonical emoji for the legacy `negative` reaction and what the
+quick row shows, while 👎 is the glyph the pre-migration UI actually drew for it
+(`assets/icons/reaction_negative.svg`), so users with either memory are served.
+`formatPermissionPrompt` names every accepted glyph, so the prompt can never
+advertise one while the poller honours another. Startup warns if a value is not a
+single emoji, if two verdicts share a glyph, or if the marker collides with an
+approval emoji.
+
+The plugin is named **`cv-channel`**, not `carbon-voice`: the latter reads as the
+Carbon Voice **MCP server**, which is a different thing — that one lets Claude query
+the Carbon Voice dataset, this one lets a Carbon Voice account talk *to* Claude. They
+otherwise sit next to each other in the same `/mcp` list under near-identical names.
+
 
 ### Deduplication
-Messages are keyed by `(channel_id, message_id, sender_id)` with a TTL. If the same message arrives twice within the window, we drop the duplicate. Useful when WebSocket + polling overlap.
+A reaction on the source message is the durable processed marker (survives restarts); the cursor bounds what gets fetched. If the same message arrives twice, the marker drops the duplicate.
 
 ### Offline Fallback
-If WebSocket drops, the client switches to polling the `/v3/messages/recent` endpoint. Polling includes a 5-second backoff. When connection restores, we resume from the last-seen cursor.
-
-### Sender Allowlist
-All senders denied by default. Calling `allow_sender(user_id)` adds them to the allowlist. Calling `block_sender(user_id)` adds them to a blocklist (overrides allowlist). Both are persisted and survive restarts.
+If WebSocket drops, the client polls `/v3/messages/recent` with backoff and resumes from the last-seen cursor when the connection restores.
 
 ## Testing
 
 ```bash
-npm test
+npm test                 # unit tests (vitest)
+npm run build && npm run smoke   # protocol smoke test against the built server
 ```
 
-Tests use **vitest**. Current coverage:
-- `permission-ui.test.ts`: Verifies the permission card builder creates valid payloads with correct action metadata.
+`scripts/smoke.mjs` boots `dist/cv-claude-channel.js` over stdio with a throwaway
+token and asserts the channel surface: both capabilities declared, the server name
+is the `cv-channel` slug, the tool list is exactly the three read-only/send tools,
+the instructions carry the untrusted-content framing, and **no allowlist write tool
+exists**. It reaches no network — `startup()` is gated behind `confirm_channels`,
+which the script never calls. Run it before publishing; it catches the whole class
+of breakage that unit tests can't see.
 
-Run `npm test:watch` to re-run on file changes.
+Coverage:
+- `permission-relay.test.ts`: verdict parsing (including IDs containing `l`, which Claude Code never issues), prompt formatting (that `input_preview` is present, redaction markers survive, reactions are only advertised when resolved), and pending-request expiry.
+- `cv-api.test.ts`: attachment parsing, path resolution, bulk URL resolution.
 
-## Commits & History
-
-- **b9e33fe**: Make CV_API_BASE configurable for local testing.
-- **403dccc**: CV-13261: attach cv_agent_ui permission card to permission messages.
-- **cd3ab21**: Merge PR #1 (add-attachment-support from PhononX).
-- **bdb5c11**: Add tests.
+The main server file is not directly testable — it connects on import. Extract pure logic into a module rather than adding side-effect-free seams to it.
 
 ## Common Workflows
 
 ### Running Locally Against cv-api
+The API base is the hardcoded `CV_API_BASE` constant at the top of `cv-api.ts` —
+it is **not** an environment variable on this branch. Edit it to point at a local
+cv-api, and don't commit that change.
+
+### Debugging the Permission Flow
+Set `CV_LOG_FILE` and watch it. The relay logs: the request arriving, whether context was stale, the CV message ID it was relayed to, reaction polling per pending message, the verdict, and expiry. A verdict for an unknown or expired ID is logged and then forwarded as ordinary chat.
+
+### Publishing
 ```bash
-CV_PAT=your-token CV_API_BASE=http://localhost:3000 npm start
+npm publish   # prepublishOnly runs the build
 ```
 
-### Debugging Permission Flow
-Add logs in `checkPendingPermissions()` to watch for reaction polling. Each reaction ID is tied to a specific action (allow, deny, allow-always).
-
-### Publishing to npm
-```bash
-npm run build
-npm publish
-```
-
-Requires npm login and access to `@carbonvoice` org.
+Bump `version` in **three** places, they must agree: `package.json`, `.claude-plugin/plugin.json`, and the `version` in the `Server` constructor. The marketplace entry's `version` should track it too.
 
 ## Known Limitations
 
-- **No typing indicator** yet (CV API doesn't support it).
-- **Reactions are the only callback mechanism** for permissions — if the user doesn't react, the permission times out.
-- **Dedup cache is in-memory** — if the server crashes and restarts, a message that arrived just before the crash might get reprocessed. Low risk because messages are idempotent.
+- **No typing indicator** (CV API doesn't support it).
+- **Permission prompts go to the last conversation that spoke.** Claude Code doesn't say which conversation triggered the work, so there is no way to attribute it precisely; the context TTL limits the blast radius.
+- **"Allow always" is per-tool, not per-argument.** Approving it for `Bash` covers any command for the rest of the session. The prompt says so explicitly.
+- **Not on the Anthropic channel allowlist**, so `--channels` alone won't load it outside an org that allowlisted it. See the install matrix in `README.md`.
+- **MCP protocol revision `2026-07-28`** cannot carry channel messages. No published SDK speaks it yet; only reachable via `MCP_PROTOCOL_NEGOTIATION=auto`.
 
 ## Integration with Broader Carbon Voice Stack
 
-- **carbon-voice-flutter**: Receives permission cards and other agent-UI payloads via the custom MIME type (`application/vnd.carbonvoice.agent-ui+json`). Renders them as interactive cards.
-- **cv-api**: Backend serving messages, permissions, reactions, sender lists.
-- **Claude Code**: The host — calls MCP tools, receives channel tags, approves tool use.
-
-See `/Users/cristian/.claude/CLAUDE.md` for repo map and broader context.
+- **carbon-voice-flutter**: renders CV messages, reactions, and attachments.
+- **cv-api**: backend serving messages, reactions, share links, sender data.
+- **Claude Code**: the host — calls MCP tools, receives channel tags, relays permission prompts.
 
 ## Style & Conventions
 
 - **No git worktrees** in this project; work on branches in the root.
-- **Small commits**: Refactors, features, and fixes are one commit each.
-- **Type safety**: TypeScript strict mode. Zod for schema validation.
-- **Imports**: ES modules only (`import`/`export`, no CommonJS).
-- **Comments**: Minimal. Only explain *why*, not *what*. Naming should make the code self-documenting.
+- **Small commits**: refactors, features, and fixes are one commit each.
+- **Type safety**: TypeScript strict mode. Zod for schema validation. Make fields optional in notification schemas — a validation failure on the relay path silently drops the whole notification.
+- **Imports**: ES modules only, with `.js` specifiers (NodeNext), in tests too.
+- **Comments**: minimal. Only explain *why*, not *what*.
