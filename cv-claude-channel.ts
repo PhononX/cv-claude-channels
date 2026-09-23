@@ -47,12 +47,12 @@ import {
   type CVConnection,
   type CVMessageEvent,
   type CVAttachment,
-  type SignalType,
 } from './cv-api.js'
 import {
   formatPermissionPrompt, parseVerdict, findOpenRequest, sweepExpired,
   type PendingPermission,
 } from './permission-relay.js'
+import { createActivitySignals } from './activity-signals.js'
 import { canonicalReactionKey, collectReactors, hasReacted, isSingleEmoji } from './reactions.js'
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -419,50 +419,15 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // ACTIVITY SIGNALS: heartbeat an ephemeral "thinking"/"tool_call" state to CV
 // ─────────────────────────────────────────────────────────────────────────────
-// This MCP server can't see Claude's think/tool loop directly — it observes three
+// This MCP server can't see Claude's think/tool loop directly — it observes a few
 // edges: handing a message to Claude (→ thinking), a permission request for a gated
-// tool (→ tool_call), and send_message (→ stop). The signal has no server-side TTL,
-// so we re-POST on an interval while a conversation is "in flight", and cap the
-// duration so a turn that ends without a reply can't leave it stuck on.
-
-const SIGNAL_BEAT_MS     = 1_500   // re-post cadence (contract: every 1-2s)
-const SIGNAL_TTL_MS      = 4_000   // client-side expiry hint while heartbeating
-const SIGNAL_STOP_TTL_MS = 500     // ttl on the final "clear" beat (server min)
-const SIGNAL_MAX_MS      = 180_000 // safety cap: auto-clear after 3m with no reply
-
-const signalBeats = new Map<string, {
-  beat: ReturnType<typeof setInterval>
-  cap: ReturnType<typeof setTimeout>
-  signalType: SignalType
-  body?: string
-}>()
-
-function startSignal(channelId: string, signalType: SignalType, body?: string): void {
-  stopSignal(channelId)
-  const tick = () => { sendSignal({ conversationId: channelId, signalType, body, ttlMs: SIGNAL_TTL_MS }).catch(() => {}) }
-  tick()
-  const beat = setInterval(tick, SIGNAL_BEAT_MS)
-  const cap = setTimeout(() => stopSignal(channelId), SIGNAL_MAX_MS)
-  beat.unref?.()
-  cap.unref?.()
-  signalBeats.set(channelId, { beat, cap, signalType, body })
-}
-
-function stopSignal(channelId: string): void {
-  const entry = signalBeats.get(channelId)
-  if (!entry) return
-  clearInterval(entry.beat)
-  clearTimeout(entry.cap)
-  signalBeats.delete(channelId)
-  // The endpoint has no explicit "clear" — a client keeps the indicator alive for the
-  // last signal's ttl_ms. Send one final beat of the same type with the minimum ttl so
-  // the dot clears in ~0.5s after the reply instead of coasting out the full window.
-  sendSignal({ conversationId: channelId, signalType: entry.signalType, body: entry.body, ttlMs: SIGNAL_STOP_TTL_MS }).catch(() => {})
-}
-
-function stopAllSignals(): void {
-  for (const channelId of [...signalBeats.keys()]) stopSignal(channelId)
-}
+// tool (→ tool_call), and send_message (→ stop). Because Claude Code sends no
+// turn-completion event, the indicator's lifecycle lives in activity-signals.ts,
+// which keeps the dot alive by re-POSTing while a turn is in flight and — the fix
+// for CV-13959 — clears it on EVERY turn end, not only send_message: it stops
+// heartbeating once no fresh edge has renewed it (idle) so the client's ttl drops
+// the dot, with an absolute per-turn cap as a backstop. See that file for the rule.
+const { startSignal, stopSignal, stopAllSignals } = createActivitySignals({ sendSignal })
 
 // ─────────────────────────────────────────────────────────────────────────────
 // PERMISSION RELAY: forward Claude Code permission prompts to CV
