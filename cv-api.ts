@@ -524,6 +524,34 @@ export interface CVConnection {
   disconnect(): void
 }
 
+// Socket.IO message:created/updated still deliver the legacy (v3) shape. The payload
+// is only a trigger: the message itself is re-read through /v6/messages/updates.
+export interface LegacySocketMessagePayload {
+  _id?: string
+  status?: string
+  channel_id?: string
+  channel_ids?: string[]
+  last_updated_at?: number
+}
+
+export function shouldFetchForSocketEvent(
+  payload: LegacySocketMessagePayload | undefined,
+  conversationId: string | undefined,
+  log: (msg: string) => void = () => {},
+): boolean {
+  const payloadChannel = payload?.channel_id ?? payload?.channel_ids?.[0] ?? 'unknown'
+  log(`cv-claude-channels: WS event (status=${payload?.status} channel=${payloadChannel}) raw=${JSON.stringify(payload)}\n`)
+  if (payload?.status !== 'active') {
+    log(`cv-claude-channels: WS event filtered out (status=${payload?.status})\n`)
+    return false
+  }
+  if (conversationId && payloadChannel !== 'unknown' && payloadChannel !== conversationId) {
+    log(`cv-claude-channels: WS event skipped (wrong channel)\n`)
+    return false
+  }
+  return true
+}
+
 export function createConnection(
   opts: CVConnectionOptions,
   callbacks: CVConnectionCallbacks,
@@ -600,25 +628,8 @@ export function createConnection(
         resolve()
       })
 
-      const onMessageEvent = async (payload: {
-        _id?: string
-        status?: string
-        channel_id?: string
-        channel_ids?: string[]
-        last_updated_at?: number
-      }) => {
-        const payloadChannel = payload?.channel_id ?? payload?.channel_ids?.[0] ?? 'unknown'
-        _log(`cv-claude-channels: WS event (status=${payload?.status} channel=${payloadChannel}) raw=${JSON.stringify(payload)}\n`)
-        if (payload?.status !== 'active') {
-          _log(`cv-claude-channels: WS event filtered out (status=${payload?.status})\n`)
-          return
-        }
-
-        if (opts.conversationId && payloadChannel !== 'unknown' && payloadChannel !== opts.conversationId) {
-          _log(`cv-claude-channels: WS event skipped (wrong channel)\n`)
-          return
-        }
-
+      const onMessageEvent = async (payload: LegacySocketMessagePayload) => {
+        if (!shouldFetchForSocketEvent(payload, opts.conversationId, _log)) return
         await callbacks.onMessageActivity()
       }
 

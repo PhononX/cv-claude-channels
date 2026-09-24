@@ -10,6 +10,7 @@ import {
   sendSignal,
   getMessageUpdates,
   getShareLink,
+  shouldFetchForSocketEvent,
   type CVAttachment,
   type FileAttachment,
   type LinkAttachment,
@@ -403,5 +404,32 @@ describe('getShareLink', () => {
   it('returns null on a non-ok response', async () => {
     mockFetch.mockResolvedValueOnce({ ok: false, status: 404 })
     expect(await getShareLink('missing')).toBeNull()
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// shouldFetchForSocketEvent — legacy socket payloads
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('shouldFetchForSocketEvent', () => {
+  const legacy = { _id: 'm1', status: 'active', channel_ids: ['conv-1'], last_updated_at: 1 }
+
+  it('triggers a fetch for an active legacy event', () => {
+    expect(shouldFetchForSocketEvent(legacy, undefined)).toBe(true)
+    expect(shouldFetchForSocketEvent(legacy, 'conv-1')).toBe(true)
+  })
+
+  it('reads the conversation from channel_id or channel_ids[0]', () => {
+    expect(shouldFetchForSocketEvent({ status: 'active', channel_id: 'conv-2' }, 'conv-1')).toBe(false)
+    expect(shouldFetchForSocketEvent({ ...legacy, channel_ids: ['conv-2'] }, 'conv-1')).toBe(false)
+  })
+
+  it('still fetches when the payload names no conversation', () => {
+    expect(shouldFetchForSocketEvent({ status: 'active' }, 'conv-1')).toBe(true)
+  })
+
+  it('ignores non-active events', () => {
+    expect(shouldFetchForSocketEvent({ ...legacy, status: 'processing' }, undefined)).toBe(false)
+    expect(shouldFetchForSocketEvent(undefined, undefined)).toBe(false)
   })
 })
