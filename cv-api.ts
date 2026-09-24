@@ -44,9 +44,11 @@ export interface CVAttachment {
 export interface CVMessageEvent {
   message_id: string
   channel_ids: string[]
+  workspace_ids?: string[]
   creator_id: string
   last_updated_at?: string
   text_models: Array<{ type: string; value: string; timecodes?: CVTimecode[] }>
+  audio_models?: Array<{ url: string; duration_ms?: number }>
   attachments?: CVAttachment[]
   parent_message_id: string | null
   share_link_id?: string | null
