@@ -41,7 +41,7 @@ import * as os from 'node:os'
 import {
   init as initApi,
   whoami, addReaction, markRead,
-  sendMessage, getRecentMessages, getShareLink, attachmentFromString,
+  sendMessage, getMessageUpdates, getShareLink, attachmentFromString,
   downloadAttachmentsToDir, downloadShareLinkAttachmentsToDir,
   createConnection, sendSignal,
   type CVConnection,
@@ -53,6 +53,7 @@ import {
   type PendingPermission,
 } from './permission-relay.js'
 import { createActivitySignals } from './activity-signals.js'
+import { syncMessageUpdates } from './message-v6.js'
 import { canonicalReactionKey, collectReactors, hasReacted, isSingleEmoji } from './reactions.js'
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -185,6 +186,7 @@ interface PendingPairing {
 
 interface State {
   lastCheckedAt: string | null             // null = never fetched; set to now on first poll
+  syncCursor: string | null                // /v6/messages/updates resume point; lastCheckedAt seeds it by date
   ownUserId: string                     // used to filter self-messages
   fetchInFlight: boolean                 // coalescing guard: fetch currently running
   fetchQueued: boolean                   // coalescing guard: another fetch waiting
@@ -210,6 +212,7 @@ interface State {
 
 const state: State = {
   lastCheckedAt: null,
+  syncCursor: null,
   ownUserId: process.env.CV_OWN_USER_ID ?? '',
   fetchInFlight: false,
   fetchQueued: false,
@@ -655,11 +658,12 @@ async function startup() {
 async function loadState() {
   try {
     const raw = await fs.readFile(STATE_PATH, 'utf8')
-    const saved = JSON.parse(raw) as { lastCheckedAt?: string; lastSeenAt?: string }
+    const saved = JSON.parse(raw) as { lastCheckedAt?: string; lastSeenAt?: string; syncCursor?: string | null }
     const cursor = saved.lastCheckedAt ?? saved.lastSeenAt
     if (cursor) {
       state.lastCheckedAt = cursor
-      log(`cv-claude-channels: resuming from ${state.lastCheckedAt}\n`)
+      state.syncCursor = saved.syncCursor ?? null
+      log(`cv-claude-channels: resuming from ${state.syncCursor ? 'stored cursor' : state.lastCheckedAt}\n`)
     }
   } catch {
     // first run — no state file yet
@@ -672,7 +676,7 @@ async function flushState() {
     await fs.mkdir(path.dirname(STATE_PATH), { recursive: true })
     await fs.writeFile(
       STATE_PATH,
-      JSON.stringify({ lastCheckedAt: state.lastCheckedAt }, null, 2),
+      JSON.stringify({ lastCheckedAt: state.lastCheckedAt, syncCursor: state.syncCursor }, null, 2),
       'utf8',
     )
     state.lastCheckedAtDirty = false
@@ -690,9 +694,10 @@ function scheduleFlush() {
   }, 5_000)
 }
 
-function updateCursor(isoTimestamp: string) {
-  log(`cv-claude-channels: updateCursor ${state.lastCheckedAt} → ${isoTimestamp}\n`)
+function updateCursor(isoTimestamp: string, syncCursor: string | null) {
+  log(`cv-claude-channels: updateCursor ${state.lastCheckedAt} → ${isoTimestamp}${syncCursor ? ' (+cursor)' : ''}\n`)
   state.lastCheckedAt = isoTimestamp
+  state.syncCursor = syncCursor
   state.lastCheckedAtDirty = true
   scheduleFlush()
 }
@@ -1092,12 +1097,12 @@ async function checkPendingAttachments(polledMessages: CVMessageEvent[]): Promis
     let updated = updatedById.get(messageId)
     if (!updated) {
       const justBefore = new Date(new Date(pending.createdAt).getTime() - 1).toISOString()
-      const refetch = await getRecentMessages({
+      const refetch = await syncMessageUpdates({
+        cursor: null,
         date: justBefore,
-        direction: 'newer',
-        limit: 100,
-        use_last_updated: true,
-        ...(CONVERSATION_ID ? { channel_id: CONVERSATION_ID } : {}),
+        conversationId: CONVERSATION_ID || pending.channelId,
+        fetchPage: getMessageUpdates,
+        log,
       })
       if (refetch.ok) {
         updated = refetch.messages.find(m => m.message_id === messageId)
@@ -1258,16 +1263,16 @@ async function fetchMissedMessagesOnce() {
   if (!state.lastCheckedAt) {
     // First run — skip history, start cursor from now
     log(`cv-claude-channels: first run, starting from ${requestStartedAt}\n`)
-    updateCursor(requestStartedAt)
+    updateCursor(requestStartedAt, null)
     return
   }
 
-  const result = await getRecentMessages({
+  const result = await syncMessageUpdates({
+    cursor: state.syncCursor,
     date: state.lastCheckedAt,
-    direction: 'newer',
-    limit: 100,
-    use_last_updated: true,
-    ...(CONVERSATION_ID ? { channel_id: CONVERSATION_ID } : {}),
+    conversationId: CONVERSATION_ID || undefined,
+    fetchPage: getMessageUpdates,
+    log,
   })
 
   if (!result.ok) {
@@ -1277,14 +1282,15 @@ async function fetchMissedMessagesOnce() {
 
   const allMessages = result.messages
 
-  // Client-side guard: CV's recent endpoint may ignore channel_id filter
+  // Client-side guard: the server scopes by conversation_id, but a leak here
+  // would put another conversation in front of Claude.
   let messages = allMessages
   if (CONVERSATION_ID) {
     messages = allMessages.filter(m => m.channel_ids.includes(CONVERSATION_ID))
     const dropped = allMessages.length - messages.length
-    if (allMessages.length > 0) {
+    if (dropped > 0) {
       log(
-        `cv-claude-channels: /recents returned ${allMessages.length} msgs, ` +
+        `cv-claude-channels: /v6/messages/updates returned ${allMessages.length} msgs, ` +
         `${dropped} filtered (channels: ${[...new Set(allMessages.map(m => m.channel_ids[0]))].join(', ')})\n`,
       )
     }
@@ -1312,16 +1318,20 @@ async function fetchMissedMessagesOnce() {
   await checkPendingPermissions(allMessages)
   await checkPendingAttachments(messages)
 
-  // Advance cursor as far as possible:
-  // - No retries: advance to requestStartedAt (current time).
-  // - Some retries: advance to just before the first stuck message so the
-  //   next fetch only re-fetches the stuck message onward — not the whole
-  //   window. Already-delivered messages in that window are deduped by markProcessed.
-  // - First message stuck: leave cursor unchanged so the stuck message is retried.
+  // Advance as far as possible:
+  // - No retries: persist the tail cursor, with requestStartedAt as the date
+  //   seed should the server ever reject that cursor.
+  // - Some retries: a cursor cannot point mid-batch, so drop it and re-anchor by
+  //   date just before the oldest update still owed. Already-delivered messages
+  //   in that window are deduped by markProcessed.
   if (firstRetryIdx === null) {
-    updateCursor(requestStartedAt)
-  } else if (firstRetryIdx > 0) {
-    updateCursor(messages[firstRetryIdx - 1].created_at)
+    updateCursor(requestStartedAt, result.cursor)
+  } else {
+    const oldestOwed = messages
+      .slice(firstRetryIdx)
+      .map(m => Date.parse(m.last_updated_at ?? m.created_at))
+      .reduce((a, b) => Math.min(a, b))
+    updateCursor(new Date(oldestOwed - 1).toISOString(), null)
   }
 }
 

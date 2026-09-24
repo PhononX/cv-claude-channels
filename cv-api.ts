@@ -2,8 +2,10 @@ import * as fs from 'node:fs/promises'
 import * as path from 'node:path'
 import * as crypto from 'node:crypto'
 import { io, Socket } from 'socket.io-client'
+import { mapV6ToEvent, type FetchUpdatesPage, type MessageV6Page } from './message-v6.js'
 
 const CV_API_BASE = 'https://api.carbonvoice.app'
+const UPDATES_PAGE_LIMIT = 200  // server default and max
 
 let _pat = ''
 let _log: (msg: string) => void = (msg) => process.stderr.write(msg)
@@ -267,18 +269,30 @@ export async function sendMessage(params: {
   return messageId
 }
 
-export async function getRecentMessages(params: {
-  date: string
-  direction: string
-  limit: number
-  use_last_updated: boolean
-  channel_id?: string
-}): Promise<{ ok: boolean; status: number; messages: CVMessageEvent[] }> {
-  _log(`cv-claude-channels: POST /v3/messages/recent ${JSON.stringify(params)}\n`)
-  const res = await cvFetch('POST', '/v3/messages/recent', params)
-  if (!res.ok) return { ok: false, status: res.status, messages: [] }
-  const data = await res.json() as CVMessageEvent[]
-  return { ok: true, status: res.status, messages: Array.isArray(data) ? data : [] }
+// One page of GET /v6/messages/updates (ordered by last_updated_at), normalised to
+// the legacy event shape. Paging lives in syncMessageUpdates (message-v6.ts).
+export const getMessageUpdates: FetchUpdatesPage = async (params) => {
+  const query = new URLSearchParams({ direction: 'newer', limit: String(UPDATES_PAGE_LIMIT) })
+  if (params.cursor) query.set('cursor', params.cursor)
+  else if (params.date) query.set('date', params.date)
+  // v6 rejects the legacy channel_id with a 400.
+  if (params.conversationId) query.set('conversation_id', params.conversationId)
+
+  const endpoint = `/v6/messages/updates?${query}`
+  _log(`cv-claude-channels: GET ${endpoint}\n`)
+  const res = await cvFetch('GET', endpoint)
+  if (!res.ok) {
+    _log(`cv-claude-channels: GET /v6/messages/updates failed ${res.status}\n`)
+    return { ok: false, status: res.status }
+  }
+  const page = await res.json() as MessageV6Page
+  return {
+    ok: true,
+    status: res.status,
+    messages: (Array.isArray(page?.data) ? page.data : []).map(mapV6ToEvent),
+    hasMore: page?.has_more === true,
+    nextCursor: page?.next_cursor ?? null,
+  }
 }
 
 export async function getShareLink(shareLinkId: string): Promise<CVShareLink | null> {

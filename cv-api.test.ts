@@ -8,6 +8,7 @@ import {
   resolveActualPath,
   resolveAttachmentUrls,
   sendSignal,
+  getMessageUpdates,
   type CVAttachment,
   type FileAttachment,
   type LinkAttachment,
@@ -280,5 +281,77 @@ describe('sendSignal', () => {
   it('is best-effort: does not throw on a non-ok response', async () => {
     mockFetch.mockResolvedValueOnce({ ok: false, status: 429 })
     await expect(sendSignal({ conversationId: 'conv-1', signalType: 'thinking' })).resolves.toBeUndefined()
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// getMessageUpdates
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('getMessageUpdates', () => {
+  const mockFetch = vi.fn()
+  const okPage = (body: unknown) => ({ ok: true, status: 200, json: async () => body })
+
+  beforeEach(() => {
+    vi.stubGlobal('fetch', mockFetch)
+    init({ pat: 'cv_pat_test', log: () => {} })
+    mockFetch.mockResolvedValue(okPage({ data: [], has_more: false, next_cursor: null }))
+  })
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+    mockFetch.mockReset()
+  })
+
+  function lastUrl(): URL {
+    return new URL(mockFetch.mock.calls.at(-1)![0])
+  }
+
+  it('GETs the v6 updates route anchored by date, direction=newer, limit 200', async () => {
+    await getMessageUpdates({ date: '2026-09-24T09:00:00.000Z' })
+    const url = lastUrl()
+    expect(url.pathname).toBe('/v6/messages/updates')
+    expect(mockFetch.mock.calls.at(-1)![1].method).toBe('GET')
+    expect(Object.fromEntries(url.searchParams)).toEqual({
+      direction: 'newer', limit: '200', date: '2026-09-24T09:00:00.000Z',
+    })
+  })
+
+  it('sends the cursor instead of the date once it has one', async () => {
+    await getMessageUpdates({ cursor: 'abc', date: '2026-09-24T09:00:00.000Z' })
+    const params = lastUrl().searchParams
+    expect(params.get('cursor')).toBe('abc')
+    expect(params.has('date')).toBe(false)
+    expect(params.get('direction')).toBe('newer')
+  })
+
+  it('scopes with conversation_id and never the legacy channel_id', async () => {
+    await getMessageUpdates({ date: '2026-09-24T09:00:00.000Z', conversationId: 'conv-1' })
+    const params = lastUrl().searchParams
+    expect(params.get('conversation_id')).toBe('conv-1')
+    expect(params.has('channel_id')).toBe(false)
+  })
+
+  it('normalises MessageV6 rows to the legacy event shape and surfaces paging fields', async () => {
+    mockFetch.mockResolvedValueOnce(okPage({
+      data: [{
+        id: 'm2', thread_id: 'm1', conversation_id: 'conv-1', workspace_id: 'w', creator_id: 'u',
+        status: 'active', created_at: '2026-09-24T10:00:00.000Z', updated_at: '2026-09-24T10:00:01.000Z',
+        content: { transcript: 'hi' }, tagged_user_ids: [],
+      }],
+      has_more: true,
+      next_cursor: 'next',
+    }))
+    const r = await getMessageUpdates({ date: '2026-09-24T09:00:00.000Z' })
+    expect(r).toMatchObject({ ok: true, hasMore: true, nextCursor: 'next' })
+    expect(r.ok && r.messages[0]).toMatchObject({
+      message_id: 'm2', channel_ids: ['conv-1'], parent_message_id: 'm1',
+      text_models: [{ type: 'transcript', value: 'hi' }],
+    })
+  })
+
+  it('reports the HTTP status on failure', async () => {
+    mockFetch.mockResolvedValueOnce({ ok: false, status: 400 })
+    expect(await getMessageUpdates({ cursor: 'bad' })).toEqual({ ok: false, status: 400 })
   })
 })
