@@ -1324,8 +1324,18 @@ async function fetchMissedMessagesOnce() {
   // - Some retries: a cursor cannot point mid-batch, so drop it and re-anchor by
   //   date just before the oldest update still owed. Already-delivered messages
   //   in that window are deduped by markProcessed.
-  if (firstRetryIdx === null) {
+  if (firstRetryIdx === null && result.complete) {
     updateCursor(requestStartedAt, result.cursor)
+  } else if (firstRetryIdx === null) {
+    // The page cap stopped this sync with more updates pending. Keep the cursor,
+    // seed the date with the newest update actually handled (not now, which would
+    // skip the rest of the backlog if the cursor were rejected), and sync again
+    // right away instead of waiting for the next socket event.
+    const newestHandled = allMessages
+      .map(m => Date.parse(m.last_updated_at ?? m.created_at))
+      .reduce((a, b) => Math.max(a, b), Date.parse(state.lastCheckedAt))
+    updateCursor(new Date(newestHandled).toISOString(), result.cursor)
+    state.fetchQueued = true
   } else {
     const oldestOwed = messages
       .slice(firstRetryIdx)

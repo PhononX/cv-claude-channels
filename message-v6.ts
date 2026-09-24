@@ -151,7 +151,9 @@ export type FetchUpdatesPage = (params: {
 }) => Promise<UpdatesPageResult>
 
 export type SyncResult =
-  | { ok: true; messages: CVMessageEvent[]; cursor: string | null; reanchored: boolean }
+  // complete=false: the page cap was hit with has_more still true, so the caller
+  // must persist the cursor and sync again rather than wait for the next event.
+  | { ok: true; messages: CVMessageEvent[]; cursor: string | null; reanchored: boolean; complete: boolean }
   | { ok: false; status: number }
 
 const MAX_PAGES_PER_SYNC = 50
@@ -184,13 +186,18 @@ export async function syncMessageUpdates(opts: {
   if (!page.ok) return { ok: false, status: page.status }
 
   let cursor: string | null = page.nextCursor ?? (reanchored ? null : opts.cursor)
+  let complete = true
   for (let pages = 1; ; pages++) {
     // Resume cursors may re-deliver ~4s of messages; the later copy is the newer state.
     for (const m of page.messages) {
       byId.delete(m.message_id)
       byId.set(m.message_id, m)
     }
-    if (!page.hasMore || !page.nextCursor || pages >= MAX_PAGES_PER_SYNC) break
+    if (!page.hasMore || !page.nextCursor) break
+    if (pages >= MAX_PAGES_PER_SYNC) {
+      complete = false
+      break
+    }
 
     const next = await safeFetch(fetchPage, { cursor: page.nextCursor, conversationId })
     if (!next.ok) return { ok: false, status: next.status }
@@ -198,7 +205,7 @@ export async function syncMessageUpdates(opts: {
     cursor = page.nextCursor ?? cursor
   }
 
-  return { ok: true, messages: [...byId.values()], cursor, reanchored }
+  return { ok: true, messages: [...byId.values()], cursor, reanchored, complete }
 }
 
 async function safeFetch(

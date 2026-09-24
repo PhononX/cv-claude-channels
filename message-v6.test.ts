@@ -122,11 +122,26 @@ describe('syncMessageUpdates', () => {
     return fn
   }
 
+  it('reports an incomplete sync when the page cap is hit with more pending', async () => {
+    const pages = Array.from({ length: 50 }, (_, i) => page([`m${i}`], true, `c${i}`))
+    const fetchPage = fetcher(...pages)
+    const r = await syncMessageUpdates({ cursor: 'stored', date: DATE, fetchPage })
+    expect(fetchPage).toHaveBeenCalledTimes(50)
+    expect(r).toMatchObject({ ok: true, cursor: 'c49', complete: false })
+    if (r.ok) expect(r.messages).toHaveLength(50)
+  })
+
+  it('is complete when the last page within the cap has no more', async () => {
+    const pages = Array.from({ length: 50 }, (_, i) => page([`m${i}`], i < 49, `c${i}`))
+    const r = await syncMessageUpdates({ cursor: 'stored', date: DATE, fetchPage: fetcher(...pages) })
+    expect(r).toMatchObject({ ok: true, cursor: 'c49', complete: true })
+  })
+
   it('anchors the first page by date when there is no cursor', async () => {
     const fetchPage = fetcher(page(['a'], false, 'c1'))
     const r = await syncMessageUpdates({ cursor: null, date: DATE, conversationId: 'conv', fetchPage })
     expect(fetchPage).toHaveBeenCalledWith({ date: DATE, conversationId: 'conv' })
-    expect(r).toEqual({ ok: true, messages: [expect.objectContaining({ message_id: 'a' })], cursor: 'c1', reanchored: false })
+    expect(r).toEqual({ ok: true, messages: [expect.objectContaining({ message_id: 'a' })], cursor: 'c1', reanchored: false, complete: true })
   })
 
   it('follows next_cursor until has_more is false and returns the tail cursor', async () => {
@@ -156,7 +171,7 @@ describe('syncMessageUpdates', () => {
   it('returns a null cursor for an empty date-anchored page', async () => {
     const fetchPage = fetcher(page([], false, null))
     const r = await syncMessageUpdates({ cursor: null, date: DATE, fetchPage })
-    expect(r).toEqual({ ok: true, messages: [], cursor: null, reanchored: false })
+    expect(r).toEqual({ ok: true, messages: [], cursor: null, reanchored: false, complete: true })
   })
 
   it('de-duplicates re-delivered messages by id, keeping the newest copy', async () => {
@@ -178,7 +193,7 @@ describe('syncMessageUpdates', () => {
       { cursor: 'stale', conversationId: undefined },
       { date: DATE, conversationId: undefined },
     ])
-    expect(r).toEqual({ ok: true, messages: [expect.objectContaining({ message_id: 'a' })], cursor: 'fresh', reanchored: true })
+    expect(r).toEqual({ ok: true, messages: [expect.objectContaining({ message_id: 'a' })], cursor: 'fresh', reanchored: true, complete: true })
     expect(log).toHaveBeenCalled()
   })
 
