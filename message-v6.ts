@@ -133,3 +133,79 @@ function mapV6Attachment(a: MessageV6Attachment): CVAttachment {
     percent_complete: a.percent_complete ?? undefined,
   }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SYNC — GET /v6/messages/updates cursor loop
+// ─────────────────────────────────────────────────────────────────────────────
+
+export type UpdatesPageResult =
+  | { ok: true; status: number; messages: CVMessageEvent[]; hasMore: boolean; nextCursor: string | null }
+  | { ok: false; status: number }
+
+export type FetchUpdatesPage = (params: {
+  date?: string
+  cursor?: string
+  conversationId?: string
+}) => Promise<UpdatesPageResult>
+
+export type SyncResult =
+  | { ok: true; messages: CVMessageEvent[]; cursor: string | null; reanchored: boolean }
+  | { ok: false; status: number }
+
+const MAX_PAGES_PER_SYNC = 50
+
+// Pages forward from the stored cursor (or from `date` when there is none) until
+// has_more is false, and returns the tail cursor to persist as the resume point.
+// A failure returns no cursor: the caller keeps the one it already has.
+export async function syncMessageUpdates(opts: {
+  cursor: string | null
+  date: string
+  conversationId?: string
+  fetchPage: FetchUpdatesPage
+  log?: (msg: string) => void
+}): Promise<SyncResult> {
+  const { conversationId, fetchPage } = opts
+  const byId = new Map<string, CVMessageEvent>()
+  let reanchored = false
+
+  let page = await safeFetch(fetchPage, opts.cursor
+    ? { cursor: opts.cursor, conversationId }
+    : { date: opts.date, conversationId })
+
+  // Only a 400 means the server no longer accepts the cursor; network errors,
+  // 401s and 5xx say nothing about it, so it must survive those.
+  if (!page.ok && page.status === 400 && opts.cursor) {
+    opts.log?.(`cv-claude-channels: stored cursor rejected (400), re-anchoring from ${opts.date}\n`)
+    reanchored = true
+    page = await safeFetch(fetchPage, { date: opts.date, conversationId })
+  }
+  if (!page.ok) return { ok: false, status: page.status }
+
+  let cursor: string | null = page.nextCursor ?? (reanchored ? null : opts.cursor)
+  for (let pages = 1; ; pages++) {
+    // Resume cursors may re-deliver ~4s of messages; the later copy is the newer state.
+    for (const m of page.messages) {
+      byId.delete(m.message_id)
+      byId.set(m.message_id, m)
+    }
+    if (!page.hasMore || !page.nextCursor || pages >= MAX_PAGES_PER_SYNC) break
+
+    const next = await safeFetch(fetchPage, { cursor: page.nextCursor, conversationId })
+    if (!next.ok) return { ok: false, status: next.status }
+    page = next
+    cursor = page.nextCursor ?? cursor
+  }
+
+  return { ok: true, messages: [...byId.values()], cursor, reanchored }
+}
+
+async function safeFetch(
+  fetchPage: FetchUpdatesPage,
+  params: Parameters<FetchUpdatesPage>[0],
+): Promise<UpdatesPageResult> {
+  try {
+    return await fetchPage(params)
+  } catch {
+    return { ok: false, status: 0 }
+  }
+}
