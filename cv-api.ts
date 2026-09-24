@@ -48,6 +48,7 @@ export interface CVAttachment {
 
 export interface CVMessageEvent {
   message_id: string
+  name?: string
   channel_ids: string[]
   workspace_ids?: string[]
   creator_id: string

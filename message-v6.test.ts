@@ -21,9 +21,10 @@ function v6(overrides: Partial<MessageV6> = {}): MessageV6 {
 
 describe('mapV6ToEvent', () => {
   it('maps core fields onto the legacy event shape', () => {
-    const e = mapV6ToEvent(v6({ share_link_id: 's1', kind: 'text' }))
+    const e = mapV6ToEvent(v6({ share_link_id: 's1', kind: 'text', name: 'Standup' }))
     expect(e).toMatchObject({
       message_id: 'm1',
+      name: 'Standup',
       channel_ids: ['c1'],
       workspace_ids: ['w1'],
       creator_id: 'u1',

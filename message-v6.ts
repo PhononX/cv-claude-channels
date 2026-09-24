@@ -36,6 +36,7 @@ export interface MessageV6 {
   id: string
   type?: string
   kind?: string
+  name?: string
   created_at: string
   updated_at: string
   deleted_at?: string
@@ -89,6 +90,7 @@ export function mapV6ToEvent(m: MessageV6): CVMessageEvent {
 
   return {
     message_id: m.id,
+    name: m.name,
     channel_ids: m.conversation_id ? [m.conversation_id] : [],
     workspace_ids: m.workspace_id ? [m.workspace_id] : [],
     creator_id: m.creator_id,
