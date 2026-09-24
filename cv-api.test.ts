@@ -9,6 +9,7 @@ import {
   resolveAttachmentUrls,
   sendSignal,
   getMessageUpdates,
+  getShareLink,
   type CVAttachment,
   type FileAttachment,
   type LinkAttachment,
@@ -353,5 +354,54 @@ describe('getMessageUpdates', () => {
   it('reports the HTTP status on failure', async () => {
     mockFetch.mockResolvedValueOnce({ ok: false, status: 400 })
     expect(await getMessageUpdates({ cursor: 'bad' })).toEqual({ ok: false, status: 400 })
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// getShareLink
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('getShareLink', () => {
+  const mockFetch = vi.fn()
+
+  beforeEach(() => {
+    vi.stubGlobal('fetch', mockFetch)
+    init({ pat: 'cv_pat_test', log: () => {} })
+  })
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+    mockFetch.mockReset()
+  })
+
+  it('reads the v6 route and normalises the MessageV6 shared message', async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        _id: 's1', share_type: 'forward', created_by: 'fwd', end_access_at: 123, has_channel_access: false,
+        shared_message: {
+          id: 'orig', thread_id: 'orig', creator_id: 'author', workspace_id: 'w', status: 'active',
+          created_at: '2026-09-24T10:00:00.000Z', updated_at: '2026-09-24T10:00:00.000Z', tagged_user_ids: [],
+          content: { time_codes: [{ t: 'hello', s: 0, e: 1 }], duration_ms: 500 },
+          attachments: [{ id: 'a1', type: 'file', url: 'https://api/x', status: 'Uploaded', filename: 'f.pdf' }],
+        },
+      }),
+    })
+    const link = await getShareLink('s1')
+    expect(mockFetch.mock.calls[0][0]).toBe('https://api.carbonvoice.app/v6/message-sharelinks/s1')
+    expect(link).toMatchObject({ share_type: 'forward', created_by: 'fwd', end_access_at: 123 })
+    expect(link?.shared_message).toMatchObject({
+      message_id: 'orig',
+      creator_id: 'author',
+      duration_ms: 500,
+      text_models: [{ type: 'transcript', value: 'hello' }],
+      attachments: [expect.objectContaining({ _id: 'a1', link: 'https://api/x', status: 'Uploaded' })],
+    })
+  })
+
+  it('returns null on a non-ok response', async () => {
+    mockFetch.mockResolvedValueOnce({ ok: false, status: 404 })
+    expect(await getShareLink('missing')).toBeNull()
   })
 })

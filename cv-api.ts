@@ -2,7 +2,10 @@ import * as fs from 'node:fs/promises'
 import * as path from 'node:path'
 import * as crypto from 'node:crypto'
 import { io, Socket } from 'socket.io-client'
-import { mapV6ToEvent, type FetchUpdatesPage, type MessageV6Page } from './message-v6.js'
+import {
+  mapV6ToEvent, mapV6ToSharedMessage,
+  type FetchUpdatesPage, type MessageShareLinkV6, type MessageV6Page,
+} from './message-v6.js'
 
 const CV_API_BASE = 'https://api.carbonvoice.app'
 const UPDATES_PAGE_LIMIT = 200  // server default and max
@@ -74,8 +77,8 @@ export interface CVSharedMessage {
 export interface CVShareLink {
   share_type: 'forward' | 'link' | string
   created_by: string
-  end_access_at?: string | null
-  revoked_at?: string | null
+  end_access_at?: number | null
+  revoked_at?: number | null
   has_channel_access?: boolean
   shared_message?: CVSharedMessage
 }
@@ -296,12 +299,20 @@ export const getMessageUpdates: FetchUpdatesPage = async (params) => {
 }
 
 export async function getShareLink(shareLinkId: string): Promise<CVShareLink | null> {
-  const res = await cvFetch('GET', `/v3/message-sharelinks/${shareLinkId}`)
+  const res = await cvFetch('GET', `/v6/message-sharelinks/${shareLinkId}`)
   if (!res.ok) {
-    _log(`cv-claude-channels: GET /v3/message-sharelinks/${shareLinkId} failed ${res.status}\n`)
+    _log(`cv-claude-channels: GET /v6/message-sharelinks/${shareLinkId} failed ${res.status}\n`)
     return null
   }
-  return res.json() as Promise<CVShareLink>
+  const link = await res.json() as MessageShareLinkV6
+  return {
+    share_type: link.share_type,
+    created_by: link.created_by,
+    end_access_at: link.end_access_at,
+    revoked_at: link.revoked_at,
+    has_channel_access: link.has_channel_access,
+    shared_message: link.shared_message ? mapV6ToSharedMessage(link.shared_message) : undefined,
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
