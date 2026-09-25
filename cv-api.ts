@@ -2,8 +2,13 @@ import * as fs from 'node:fs/promises'
 import * as path from 'node:path'
 import * as crypto from 'node:crypto'
 import { io, Socket } from 'socket.io-client'
+import {
+  mapV6ToEvent, mapV6ToSharedMessage,
+  type FetchUpdatesPage, type MessageShareLinkV6, type MessageV6Page,
+} from './message-v6.js'
 
 const CV_API_BASE = 'https://api.carbonvoice.app'
+const UPDATES_PAGE_LIMIT = 200  // server default and max
 
 let _pat = ''
 let _log: (msg: string) => void = (msg) => process.stderr.write(msg)
@@ -43,10 +48,13 @@ export interface CVAttachment {
 
 export interface CVMessageEvent {
   message_id: string
+  name?: string
   channel_ids: string[]
+  workspace_ids?: string[]
   creator_id: string
   last_updated_at?: string
   text_models: Array<{ type: string; value: string; timecodes?: CVTimecode[] }>
+  audio_models?: Array<{ url: string; duration_ms?: number }>
   attachments?: CVAttachment[]
   parent_message_id: string | null
   share_link_id?: string | null
@@ -70,8 +78,8 @@ export interface CVSharedMessage {
 export interface CVShareLink {
   share_type: 'forward' | 'link' | string
   created_by: string
-  end_access_at?: string | null
-  revoked_at?: string | null
+  end_access_at?: number | null
+  revoked_at?: number | null
   has_channel_access?: boolean
   shared_message?: CVSharedMessage
 }
@@ -265,27 +273,47 @@ export async function sendMessage(params: {
   return messageId
 }
 
-export async function getRecentMessages(params: {
-  date: string
-  direction: string
-  limit: number
-  use_last_updated: boolean
-  channel_id?: string
-}): Promise<{ ok: boolean; status: number; messages: CVMessageEvent[] }> {
-  _log(`cv-claude-channels: POST /v3/messages/recent ${JSON.stringify(params)}\n`)
-  const res = await cvFetch('POST', '/v3/messages/recent', params)
-  if (!res.ok) return { ok: false, status: res.status, messages: [] }
-  const data = await res.json() as CVMessageEvent[]
-  return { ok: true, status: res.status, messages: Array.isArray(data) ? data : [] }
+// One page of GET /v6/messages/updates (ordered by last_updated_at), normalised to
+// the legacy event shape. Paging lives in syncMessageUpdates (message-v6.ts).
+export const getMessageUpdates: FetchUpdatesPage = async (params) => {
+  const query = new URLSearchParams({ direction: 'newer', limit: String(UPDATES_PAGE_LIMIT) })
+  if (params.cursor) query.set('cursor', params.cursor)
+  else if (params.date) query.set('date', params.date)
+  // v6 rejects the legacy channel_id with a 400.
+  if (params.conversationId) query.set('conversation_id', params.conversationId)
+
+  const endpoint = `/v6/messages/updates?${query}`
+  _log(`cv-claude-channels: GET ${endpoint}\n`)
+  const res = await cvFetch('GET', endpoint)
+  if (!res.ok) {
+    _log(`cv-claude-channels: GET /v6/messages/updates failed ${res.status}\n`)
+    return { ok: false, status: res.status }
+  }
+  const page = await res.json() as MessageV6Page
+  return {
+    ok: true,
+    status: res.status,
+    messages: (Array.isArray(page?.data) ? page.data : []).map(mapV6ToEvent),
+    hasMore: page?.has_more === true,
+    nextCursor: page?.next_cursor ?? null,
+  }
 }
 
 export async function getShareLink(shareLinkId: string): Promise<CVShareLink | null> {
-  const res = await cvFetch('GET', `/v3/message-sharelinks/${shareLinkId}`)
+  const res = await cvFetch('GET', `/v6/message-sharelinks/${shareLinkId}`)
   if (!res.ok) {
-    _log(`cv-claude-channels: GET /v3/message-sharelinks/${shareLinkId} failed ${res.status}\n`)
+    _log(`cv-claude-channels: GET /v6/message-sharelinks/${shareLinkId} failed ${res.status}\n`)
     return null
   }
-  return res.json() as Promise<CVShareLink>
+  const link = await res.json() as MessageShareLinkV6
+  return {
+    share_type: link.share_type,
+    created_by: link.created_by,
+    end_access_at: link.end_access_at,
+    revoked_at: link.revoked_at,
+    has_channel_access: link.has_channel_access,
+    shared_message: link.shared_message ? mapV6ToSharedMessage(link.shared_message) : undefined,
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -496,6 +524,34 @@ export interface CVConnection {
   disconnect(): void
 }
 
+// Socket.IO message:created/updated still deliver the legacy (v3) shape. The payload
+// is only a trigger: the message itself is re-read through /v6/messages/updates.
+export interface LegacySocketMessagePayload {
+  _id?: string
+  status?: string
+  channel_id?: string
+  channel_ids?: string[]
+  last_updated_at?: number
+}
+
+export function shouldFetchForSocketEvent(
+  payload: LegacySocketMessagePayload | undefined,
+  conversationId: string | undefined,
+  log: (msg: string) => void = () => {},
+): boolean {
+  const payloadChannel = payload?.channel_id ?? payload?.channel_ids?.[0] ?? 'unknown'
+  log(`cv-claude-channels: WS event (status=${payload?.status} channel=${payloadChannel}) raw=${JSON.stringify(payload)}\n`)
+  if (payload?.status !== 'active') {
+    log(`cv-claude-channels: WS event filtered out (status=${payload?.status})\n`)
+    return false
+  }
+  if (conversationId && payloadChannel !== 'unknown' && payloadChannel !== conversationId) {
+    log(`cv-claude-channels: WS event skipped (wrong channel)\n`)
+    return false
+  }
+  return true
+}
+
 export function createConnection(
   opts: CVConnectionOptions,
   callbacks: CVConnectionCallbacks,
@@ -572,25 +628,8 @@ export function createConnection(
         resolve()
       })
 
-      const onMessageEvent = async (payload: {
-        _id?: string
-        status?: string
-        channel_id?: string
-        channel_ids?: string[]
-        last_updated_at?: number
-      }) => {
-        const payloadChannel = payload?.channel_id ?? payload?.channel_ids?.[0] ?? 'unknown'
-        _log(`cv-claude-channels: WS event (status=${payload?.status} channel=${payloadChannel}) raw=${JSON.stringify(payload)}\n`)
-        if (payload?.status !== 'active') {
-          _log(`cv-claude-channels: WS event filtered out (status=${payload?.status})\n`)
-          return
-        }
-
-        if (opts.conversationId && payloadChannel !== 'unknown' && payloadChannel !== opts.conversationId) {
-          _log(`cv-claude-channels: WS event skipped (wrong channel)\n`)
-          return
-        }
-
+      const onMessageEvent = async (payload: LegacySocketMessagePayload) => {
+        if (!shouldFetchForSocketEvent(payload, opts.conversationId, _log)) return
         await callbacks.onMessageActivity()
       }
 

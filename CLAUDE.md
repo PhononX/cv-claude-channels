@@ -25,7 +25,7 @@ Published as `@carbonvoice/cv-claude-channel` on npm, and installable as the `cv
 Only `allow` and `deny` exist on the wire. "Allow always" is ours: it adds the tool name to a session-only set (`state.allowAlwaysTools`) and sends `allow`.
 
 ### State Persistence
-- **Cursor**: Last-checked timestamp on disk (`<config>/channels/cv/state.json`), debounced 5s.
+- **Cursor**: `syncCursor` (the `/v6/messages/updates` `next_cursor`) plus `lastCheckedAt` (the date seed used when there is no cursor, or when the server rejects it with a 400) in `<config>/channels/cv/state.json`, debounced 5s. Advanced only after the whole batch is handled; a retryable message drops the cursor and re-anchors by date.
 - **Allowlist**: `<config>/channels/cv/access.json`. **Read-only to this server** — see below.
 - **Pairing codes**: `<config>/channels/cv/pending.json`. **Server-owned**, read by the skill.
 - **Token**: `<config>/channels/cv/.env`, written by `/cv-channel:configure`.
@@ -201,7 +201,7 @@ otherwise sit next to each other in the same `/mcp` list under near-identical na
 A reaction on the source message is the durable processed marker (survives restarts); the cursor bounds what gets fetched. If the same message arrives twice, the marker drops the duplicate.
 
 ### Offline Fallback
-If WebSocket drops, the client polls `/v3/messages/recent` with backoff and resumes from the last-seen cursor when the connection restores.
+If WebSocket drops, the client polls `GET /v6/messages/updates` with backoff and resumes from the last-seen cursor when the connection restores. Socket events are only a trigger (they still carry the legacy v3 shape); every read goes through `/v6/messages/updates`, and `mapV6ToEvent()` in `message-v6.ts` normalises MessageV6 onto the legacy `CVMessageEvent` so one processing path serves both.
 
 ## Testing
 
@@ -220,7 +220,8 @@ of breakage that unit tests can't see.
 
 Coverage:
 - `permission-relay.test.ts`: verdict parsing (including IDs containing `l`, which Claude Code never issues), prompt formatting (that `input_preview` is present, redaction markers survive, reactions are only advertised when resolved), and pending-request expiry.
-- `cv-api.test.ts`: attachment parsing, path resolution, bulk URL resolution.
+- `cv-api.test.ts`: attachment parsing, path resolution, bulk URL resolution, the v6 updates/share-link requests, the legacy socket-event filter.
+- `message-v6.test.ts`: the MessageV6 → legacy normaliser and the updates cursor loop (paging, dedupe, 400 re-anchor, cursor kept on other errors).
 
 The main server file is not directly testable — it connects on import. Extract pure logic into a module rather than adding side-effect-free seams to it.
 
