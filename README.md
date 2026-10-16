@@ -76,9 +76,12 @@ own account count as Claude's, so they're ignored, with no error.
 2. **Install the plugin.**
 
    ```
-   /plugin marketplace add PhononX/cv-claude-channel
+   /plugin marketplace add PhononX/claude-plugins
    /plugin install cv-channel@carbonvoice
    ```
+
+   `PhononX/claude-plugins` is the Carbon Voice marketplace: it lists this plugin and the
+   Chief of Staff plugin, and it's the one the installers use.
 
    Choose the **user** scope so it works across projects. If the summary says `Run /reload-plugins to activate.`, run that.
 
@@ -92,10 +95,10 @@ own account count as Claude's, so they're ignored, with no error.
 
 4. **Restart with the channel enabled.** See the table below for the flag your plan needs.
 
-5. **Allow yourself.** Every sender is denied by default, so the first message is *supposed* to be dropped. Message the Agent Account from your own account. Claude reports the sender ID; then run:
+5. **Pair your account.** Every sender is denied by default. Message the Agent Account from your own account: it replies with a 6-character pairing code. Then run:
 
    ```
-   /cv-channel:access allow <user-id>
+   /cv-channel:access pair <code>
    ```
 
    That takes effect on the next message — no restart. Message again and it reaches Claude.
@@ -108,7 +111,7 @@ Allowing someone lets them send messages Claude acts on **and** approve relayed 
 | --- | --- |
 | Nothing arrives, no error | You messaged while signed in as the Agent Account. Message it from your own account. |
 | `/mcp` shows the server failed | No token yet — run `/cv-channel:configure`. |
-| Messages dropped, Claude mentions an unknown sender | Working as intended. Allow the ID (step 5). |
+| A pairing code comes back instead of an answer | Working as intended. Pair it (step 5). |
 | Startup says "blocked by org policy" | Your organization has not enabled channels; no flag gets around it. |
 | Channel never connects, but the server is healthy | You started Claude without the channel flag, so the channel isn't registered. |
 

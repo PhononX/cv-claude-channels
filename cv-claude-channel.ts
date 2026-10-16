@@ -8,7 +8,7 @@
  * and lets Claude reply back into the originating CV conversation.
  *
  * SETUP — install as a plugin, which supplies .mcp.json and the slash commands:
- *   /plugin marketplace add PhononX/cv-claude-channel
+ *   /plugin marketplace add PhononX/claude-plugins
  *   /plugin install cv-channel@carbonvoice
  *   /cv-channel:configure <personal-access-token>
  *   claude --dangerously-load-development-channels plugin:cv-channel@carbonvoice
