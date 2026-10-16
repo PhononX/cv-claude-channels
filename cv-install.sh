@@ -606,13 +606,9 @@ printf '  %-20s %s\n' "Who can message it:" "$([ -n "$OWNER_ALLOWED" ] && echo "
 printf '  %-20s %s\n' "Start it with:" "$(hl ./cv-run.sh)  (or $(hl "./cv-run.sh -- --continue") to pick up where you left off)"
 printf '  %-20s %s\n' "Update with:" "$(hl ./cv-update.sh)"
 echo
-# The Terminal window, not stdin: under `curl | bash` stdin is the script itself.
-if { : </dev/tty; } 2>/dev/null; then
-  ask "  Press Return to start Claude now, or Ctrl+C to start it later." >/dev/null
-  cd "$DIR"; rm -rf "$WORK"; trap - EXIT
-  exec ./cv-run.sh </dev/tty
-fi
-echo "  To start it: $(hl "cd $(shown "$DIR") && ./cv-run.sh")"
+# The user starts Claude themselves. Starting it from here (exec ./cv-run.sh </dev/tty) froze
+# Claude under `curl ... | bash`.
+echo "  Start it now: $(hl "cd $(shown "$DIR") && ./cv-run.sh")"
 echo
 }
 
