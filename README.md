@@ -35,8 +35,9 @@ It shows what it will do and waits for your OK, then:
    missing and signs it in to your Claude account, or offers to update it. Channels are new and
    improving quickly, so the latest version works best.
 2. Installs the `cv-channel` plugin, or updates it.
-3. Asks for the Agent Account's token, checks it with Carbon Voice, and saves it in this folder
-   (`.cv/`, added to `.gitignore`). If you created the Agent Account, it offers to let your own
+3. Asks for the Agent Account's token, checks it with Carbon Voice, and saves it for this folder,
+   outside the project in `~/.claude/channels/cv/projects/`, where Claude can't read it without
+   asking. If you created the Agent Account, it offers to let your own
    account message it without a pairing code.
 4. Adds `./cv-run.sh`, which starts Claude here connected to Carbon Voice with the right flag for
    your plan, and `./cv-update.sh`. It also lets Claude use the channel's tools without asking, and
@@ -53,8 +54,9 @@ Then, day to day:
 | `./cv-run.sh --background` | Keeps running after you close the window (needs tmux). Run it again to reconnect. |
 | `./cv-run.sh --help` | Lists the other options: `--no-remote`, `--reset-token`, `--log on\|off\|show`. |
 
-Each folder set up this way is its own agent, with its own token and allowlist in `.cv/` (the
-`CV_*_PATH` variables below point there). The rest of this section is the manual way to do the same.
+Each folder set up this way is its own agent, with its own token, and its own allowlist in `.cv/`
+(added to `.gitignore`; the `CV_*_PATH` variables below point there). The rest of this section is
+the manual way to do the same.
 
 ### Before you start: you need two Carbon Voice accounts
 

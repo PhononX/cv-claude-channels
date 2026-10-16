@@ -5,7 +5,7 @@
 #   curl -fsSL https://raw.githubusercontent.com/PhononX/cv-claude-channels/main/cv-install.sh | bash
 #
 # It installs Claude Code if it's missing (or offers to update it, since channel support changes
-# quickly), installs or updates the cv-channel plugin, saves your Carbon Voice Agent Account's token in
+# quickly), installs or updates the cv-channel plugin, saves your Carbon Voice Agent Account's token for
 # this folder, and writes two scripts there. Nothing else in the project changes.
 #
 #   ./cv-run.sh      start Claude here, connected to Carbon Voice, with the right options for
@@ -204,17 +204,21 @@ export PATH="$HOME/.local/bin:$PATH"
 unset ANTHROPIC_API_KEY
 CV_DIR="$PWD/.cv"
 mkdir -p "$CV_DIR" && chmod 700 "$CV_DIR"
-if [[ $RESET == 1 ]]; then rm -f "$CV_DIR/.env"; fi
-if [[ ! -s "$CV_DIR/.env" ]]; then
+# The token is kept outside the project, where Claude can't read it without asking, and out of
+# Claude's environment, which every command Claude runs inherits: the plugin reads the file itself.
+TOKEN_FILE="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/channels/cv/projects/{{PROJECT_ID}}/.env"
+if [[ $RESET == 1 ]]; then rm -f "$TOKEN_FILE"; fi
+if [[ ! -s "$TOKEN_FILE" ]]; then
   echo "Paste the Personal Access Token for your Carbon Voice Agent Account."
-  echo "(It's hidden as you type and saved only in this folder.)"
+  echo "(It's hidden as you type, and saved for this folder only.)"
   read -rsp "Token: " PAT; echo
   [[ -n "$PAT" ]] || { echo "No token entered."; exit 1; }
-  (umask 077; printf 'CV_PAT=%s\n' "$PAT" > "$CV_DIR/.env"); unset PAT
+  mkdir -p "${TOKEN_FILE%/*}" && chmod 700 "${TOKEN_FILE%/*}"
+  (umask 077; printf 'CV_PAT=%s\n' "$PAT" > "$TOKEN_FILE"); unset PAT
 fi
-set -a; source "$CV_DIR/.env"; set +a
+unset CV_PAT
+export CV_ENV_PATH="$TOKEN_FILE"
 # This folder's own channel state, so it's its own agent with its own allowlist and cursor.
-export CV_ENV_PATH="$CV_DIR/.env"
 export CV_STATE_PATH="$CV_DIR/state.json"
 export CV_ACCESS_PATH="$CV_DIR/access.json"
 export CV_PENDING_PATH="$CV_DIR/pending.json"
@@ -273,7 +277,7 @@ echo
 
 if [[ $BACKGROUND == 1 ]]; then
   command -v tmux >/dev/null || { echo "tmux is not installed. Run without --background."; exit 1; }
-  exec tmux new-session -A -s "cv-$(basename "$PWD")" "${CMD[@]}"
+  exec tmux new-session -A -s "cv-{{PROJECT_ID}}" "${CMD[@]}"
 fi
 exec "${CMD[@]}"
 TEMPLATE
@@ -319,6 +323,11 @@ if [[ "${1:-}" == --update ]]; then
 fi
 export PATH="$BIN:$PATH"
 CV_DIR="$DIR/.cv"
+# Names this folder's token directory and background session: the folder's name, plus a checksum
+# of its full path so two folders with the same name don't collide.
+PROJECT_ID="$(printf '%s' "$(basename "$DIR")" | tr -c 'A-Za-z0-9_-' '-' | cut -c1-40)-$(printf '%s' "$DIR" | cksum | cut -d' ' -f1)"
+TOKEN_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/channels/cv/projects/$PROJECT_ID"
+TOKEN_FILE="$TOKEN_DIR/.env"
 [[ "$DIR" != / ]] || die "Run this from inside your project's folder, not the top of the disk."
 [[ -w "$DIR" ]] || die "Can't write to $(shown "$DIR"). Run this from a project folder you own."
 if [[ -f "$DIR/cos/.version" ]]; then
@@ -348,7 +357,7 @@ else
     echo "  1. Check Claude Code is up to date, and offer to update it."
   fi
   echo "  2. Install or update the Carbon Voice plugin (cv-channel)."
-  echo "  3. Ask for your Carbon Voice Agent Account's token, and save it in this folder (.cv/)."
+  echo "  3. Ask for your Carbon Voice Agent Account's token, and save it for this folder."
   echo "  4. Add ./cv-run.sh, which starts Claude here connected to Carbon Voice, and ./cv-update.sh."
   echo "Nothing else in the project changes."
 fi
@@ -429,11 +438,14 @@ fi
 
 # ---------- 3. the agent's token ----------
 step "Your Carbon Voice agent"
-mkdir -p "$CV_DIR"; chmod 700 "$CV_DIR"
+mkdir -p "$CV_DIR" "$TOKEN_DIR"; chmod 700 "$CV_DIR" "$TOKEN_DIR"
+# Earlier versions of this script kept the token in .cv/, inside the project.
+if [[ -s "$CV_DIR/.env" && ! -s "$TOKEN_FILE" ]]; then mv "$CV_DIR/.env" "$TOKEN_FILE"; fi
+rm -f "$CV_DIR/.env"
 PAT=""; AGENT_NAME=""
-if [[ -s "$CV_DIR/.env" ]]; then
+if [[ -s "$TOKEN_FILE" ]]; then
   if [[ $MODE == update ]] || { info "This folder already has a Carbon Voice token saved."; yes "  Keep it? [Y/n]"; }; then
-    PAT=$(sed -n 's/^[[:space:]]*CV_PAT[[:space:]]*=[[:space:]]*//p' "$CV_DIR/.env" | head -1)
+    PAT=$(sed -n 's/^[[:space:]]*CV_PAT[[:space:]]*=[[:space:]]*//p' "$TOKEN_FILE" | head -1)
     case "$(cv_whoami "$PAT")" in
       200) AGENT_NAME=$(json "$WORK/whoami.json" '[d.user.first_name, d.user.last_name].filter(Boolean).join(" ")'); ok "Keeping the saved token${AGENT_NAME:+ for $AGENT_NAME}" ;;
       401|403) warn "The saved token doesn't work any more, so you'll need a new one."; PAT="" ;;
@@ -460,7 +472,7 @@ if [[ -z "$PAT" ]]; then
     break
   done
   [[ -n "$PAT" ]] || die "No working token. Run this again when you have your Agent Account's token."
-  (umask 077; printf 'CV_PAT=%s\n' "$PAT" > "$CV_DIR/.env"); chmod 600 "$CV_DIR/.env"
+  (umask 077; printf 'CV_PAT=%s\n' "$PAT" > "$TOKEN_FILE"); chmod 600 "$TOKEN_FILE"
   ok "Token saved for ${AGENT_NAME:-your agent}"
 fi
 AGENT_NAME=${AGENT_NAME:-$(saved AGENT_NAME)}; AGENT_NAME=${AGENT_NAME:-$(basename "$DIR")}
@@ -521,7 +533,8 @@ fi
 SCRIPT_NAME=$(printf '%s' "$AGENT_NAME" | tr -d '"$`\\')
 cv_run_template > "$WORK/cv-run.template"
 fill "$WORK/cv-run.template" "$WORK/cv-run.sh" AGENT_NAME="$SCRIPT_NAME" CLAUDE_BIN="$(command -v claude)" \
-  CHANNEL_ARGS="$CHANNEL_ARGS" REMOTE_ARGS="$REMOTE_ARGS" INSTALL_URL="$INSTALL_URL"
+  CHANNEL_ARGS="$CHANNEL_ARGS" REMOTE_ARGS="$REMOTE_ARGS" INSTALL_URL="$INSTALL_URL" \
+  PROJECT_ID="$PROJECT_ID"
 cv_update_template > "$WORK/cv-update.template"
 fill "$WORK/cv-update.template" "$WORK/cv-update.sh" INSTALL_URL="$INSTALL_URL"
 for f in cv-run.sh cv-update.sh; do
@@ -533,6 +546,7 @@ ok "./cv-run.sh starts Claude here, connected to Carbon Voice; ./cv-update.sh up
 # In this project only, and only for you (.claude/settings.local.json isn't shared): Carbon
 # Voice's own tools run without asking, and Claude can't read or change the token.
 mkdir -p "$DIR/.claude"
+case "$TOKEN_DIR" in "$HOME"/*) TOKEN_RULE="~/${TOKEN_DIR#"$HOME"/}/**" ;; *) TOKEN_RULE="/$TOKEN_DIR/**" ;; esac
 if node -e '
     const fs = require("fs"), f = process.argv[1]; let s = {};
     try { if (fs.existsSync(f) && fs.statSync(f).size) s = JSON.parse(fs.readFileSync(f, "utf8")); } catch (e) { process.exit(2); }
@@ -540,17 +554,18 @@ if node -e '
     const add = (k, v) => { s.permissions[k] = [...new Set([...(s.permissions[k] || []), ...v])]; };
     add("allow", ["mcp__plugin_cv-channel_cv-channel__confirm_channels", "mcp__plugin_cv-channel_cv-channel__send_message",
                   "mcp__plugin_cv-channel_cv-channel__list_senders"]);
-    add("deny", ["Read(./.cv/.env)", "Edit(./.cv/**)", "Write(./.cv/**)"]);
+    const t = process.argv[2];
+    add("deny", [`Read(${t})`, `Edit(${t})`, `Write(${t})`, "Edit(./.cv/**)", "Write(./.cv/**)"]);
     fs.writeFileSync(f, JSON.stringify(s, null, 2) + "\n");
-  ' "$DIR/.claude/settings.local.json" </dev/null; then
+  ' "$DIR/.claude/settings.local.json" "$TOKEN_RULE" </dev/null; then
   ok "Claude can use Carbon Voice here without asking each time, and can't read the token"
 else
   warn "Couldn't read .claude/settings.local.json, so it was left as it was. Claude will ask before using Carbon Voice."
 fi
 if git -C "$DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1 </dev/null || [[ -f "$DIR/.gitignore" ]]; then
   touch "$DIR/.gitignore"
-  grep -qxF '.cv/' "$DIR/.gitignore" || printf '\n# Carbon Voice token and channel state (cv-install.sh)\n.cv/\n' >> "$DIR/.gitignore"
-  ok ".cv/ is in .gitignore, so the token stays out of git"
+  grep -qxF '.cv/' "$DIR/.gitignore" || printf '\n# Carbon Voice channel state (cv-install.sh)\n.cv/\n' >> "$DIR/.gitignore"
+  ok ".cv/, this folder's Carbon Voice state, is in .gitignore"
 fi
 {
   echo "# Answers to cv-install.sh, reused by ./cv-update.sh. You can edit them (1 = yes, 0 = no)."
