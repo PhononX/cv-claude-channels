@@ -53,6 +53,7 @@ import {
   type PendingPermission,
 } from './permission-relay.js'
 import { createActivitySignals } from './activity-signals.js'
+import { startupCheckDelay } from './startup-check.js'
 import { syncMessageUpdates } from './message-v6.js'
 import { canonicalReactionKey, collectReactors, hasReacted, isSingleEmoji } from './reactions.js'
 
@@ -240,7 +241,7 @@ let connection: CVConnection | null = null
 const mcp = new Server(
   // Slug, not a display name: Claude Code derives the <channel source="..."> attribute
   // from this, so it has to be a valid identifier.
-  { name: 'cv-channel', version: '0.3.0' },
+  { name: 'cv-channel', version: '0.3.2' },
   {
     capabilities: {
       experimental: {
@@ -1384,15 +1385,20 @@ await new Promise<void>(resolve => {
 })
 log(`cv-claude-channels: MCP handshake complete, client=${JSON.stringify(mcp.getClientVersion())}\n`)
 
-try {
-  await mcp.notification({
-    method: 'notifications/claude/channel',
-    params: {
-      content: `STARTUP CHECK: Call the confirm_channels tool to activate Carbon Voice channels.`,
-      meta: { event: 'startup_check' },
-    },
-  })
-  log(`cv-claude-channels: startup check sent — waiting for confirm_channels tool call\n`)
-} catch (err) {
-  log(`cv-claude-channels: startup notification failed — passive mode: ${err}\n`)
+async function sendStartupCheck(attempt: number): Promise<void> {
+  if (state.cvStarted) return
+  try {
+    await mcp.notification({
+      method: 'notifications/claude/channel',
+      params: {
+        content: `STARTUP CHECK: Call the confirm_channels tool to activate Carbon Voice channels.`,
+        meta: { event: 'startup_check' },
+      },
+    })
+    log(`cv-claude-channels: startup check sent (attempt ${attempt + 1}) — waiting for confirm_channels tool call\n`)
+  } catch (err) {
+    log(`cv-claude-channels: startup notification failed (attempt ${attempt + 1}): ${err}\n`)
+  }
+  setTimeout(() => { void sendStartupCheck(attempt + 1) }, startupCheckDelay(attempt)).unref()
 }
+await sendStartupCheck(0)

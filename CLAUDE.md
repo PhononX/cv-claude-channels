@@ -146,6 +146,7 @@ output. Only the npm source is supported.
 - **permission-relay.ts**: pure helpers — verdict parsing, prompt formatting, pending-request bookkeeping. Extracted so it is testable without booting the server.
 - **permission-relay.test.ts**: tests for the above.
 - **cv-api.ts** / **cv-api.test.ts**: CV API client wrapper.
+- **startup-check.ts**: the retry schedule for the startup check. Claude Code can drop a channel notification sent before the session is ready (while the trust or development-channel prompt is up), and the check is the only thing that turns the channel on, so it is re-sent until `confirm_channels` arrives.
 - **.claude-plugin/plugin.json**: plugin manifest.
 - **.claude-plugin/marketplace.json**: marketplace catalog; points at the npm package.
 - **.mcp.json**: plugin-supplied server config. **Committed** — `--plugin-dir .` and `claude plugin validate` both need it, and the npm tarball is the plugin. Because the plugin root is also the repo root, opening this repo in Claude Code will offer it as a *project* MCP server, where `${CLAUDE_PLUGIN_ROOT}` doesn't expand and the entry fails. Decline it; use `--plugin-dir .` to test the real thing. Claude Code does **not** read `.mcp.json.local` — for a bare-server dev loop put the entry in user-level `~/.claude.json` with an absolute path instead. **Upgrading from before 0.2.0: back up your local `.mcp.json` first.** It used to be gitignored, and git silently overwrites an ignored file when a commit starts tracking it — pulling will destroy your dev config with no warning or conflict.

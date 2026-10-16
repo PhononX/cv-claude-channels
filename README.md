@@ -20,8 +20,9 @@ If your computer is offline, messages queue and are delivered when the connectio
 ### Quick setup: one command in your project's folder
 
 You'll need a Claude Pro, Max, Team or Enterprise plan (Claude Code itself is installed for you if
-you don't have it yet), and a Personal Agent Account in Carbon Voice for Claude to talk as, with its
-Personal Access Token.
+you don't have it yet), and a Personal Agent Account for Claude to talk as, with its Personal Access
+Token. You create the Agent Account from your own Carbon Voice account; see
+[Your Carbon Voice account and Claude's Agent Account](#your-carbon-voice-account-and-claudes-agent-account).
 In Terminal, go to your project's folder and run:
 
 ```
@@ -58,18 +59,19 @@ Each folder set up this way is its own agent, with its own token, and its own al
 (added to `.gitignore`; the `CV_*_PATH` variables below point there). The rest of this section is
 the manual way to do the same.
 
-### Before you start: you need two Carbon Voice accounts
+### Your Carbon Voice account and Claude's Agent Account
 
-The Personal Access Token identifies the **Claude side** of the conversation. Messages from that account are treated as Claude's own and are ignored, so **you cannot message the channel from the account whose token you used** — nothing will arrive, and there is no error.
+You only need your own Carbon Voice account. From it, create a **Personal Agent Account** for
+Claude: that's who you talk to in Carbon Voice, and Claude replies as it. You can create one Agent
+Account for each project you connect.
 
-So either:
-
-- **Team use (the normal case).** Use your own token. Colleagues message you in Carbon Voice, Claude does the work on your machine and replies in your conversation.
-- **Solo use.** Create a second Carbon Voice account to act as the bot, use *its* token, and message it from your personal account.
+Claude uses the **Agent Account's** Personal Access Token, and you message the Agent Account from
+your own account. Don't message it while signed in as the Agent Account: messages from the token's
+own account count as Claude's, so they're ignored, with no error.
 
 ### Steps
 
-1. **Get a Personal Access Token** from Carbon Voice, for whichever account is the Claude side.
+1. **Get the Agent Account's Personal Access Token** from Carbon Voice.
 
 2. **Install the plugin.**
 
@@ -90,7 +92,7 @@ So either:
 
 4. **Restart with the channel enabled.** See the table below for the flag your plan needs.
 
-5. **Allow yourself.** Every sender is denied by default, so the first message is *supposed* to be dropped. Send one voice message from your other account. Claude reports the sender ID; then run:
+5. **Allow yourself.** Every sender is denied by default, so the first message is *supposed* to be dropped. Message the Agent Account from your own account. Claude reports the sender ID; then run:
 
    ```
    /cv-channel:access allow <user-id>
@@ -104,7 +106,7 @@ Allowing someone lets them send messages Claude acts on **and** approve relayed 
 
 | Symptom | Cause |
 | --- | --- |
-| Nothing arrives, no error | You messaged from the token's own account. Use a different one. |
+| Nothing arrives, no error | You messaged while signed in as the Agent Account. Message it from your own account. |
 | `/mcp` shows the server failed | No token yet — run `/cv-channel:configure`. |
 | Messages dropped, Claude mentions an unknown sender | Working as intended. Allow the ID (step 5). |
 | Startup says "blocked by org policy" | Your organization has not enabled channels; no flag gets around it. |

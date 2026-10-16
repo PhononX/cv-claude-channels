@@ -33,7 +33,18 @@ ok()   { printf '  %s✓%s %s\n' "$green" "$reset" "$1"; }
 info() { printf '  %s%s%s\n' "$dim" "$1" "$reset"; }
 warn() { printf '  %s!%s %s\n' "$yellow" "$reset" "$1"; }
 die()  { printf '\n%s✗ %s%s\n' "$red" "$1" "$reset" >&2; exit 1; }
-ask()  { local reply; read -r -p "$1 " reply </dev/tty || true; printf '%s' "$reply"; }
+# Questions stand out from the output around them: a blank line, a cyan marker, the question in
+# bold and the choices in cyan. The prompt goes straight to the terminal, so $(ask ...) captures
+# only the reply. When piped from curl, stdin is this script, so answers come from the terminal.
+ask() {
+  local q=$1 lead opts="" mark="?" reply re='^(.*[^ ]) +(\[[^]]*\]):?$'
+  lead=${q%%[! ]*}; q=${q#"$lead"}
+  if [[ $q =~ $re ]]; then q=${BASH_REMATCH[1]}; opts=${BASH_REMATCH[2]}; fi
+  if [[ -z "$opts" && "$q" != *"?"* ]]; then mark="↵"; fi
+  printf '\n%s%s%s%s %s%s%s%s %s›%s ' "$lead" "$bold$cyan" "$mark" "$reset" "$bold" "$q" "$reset" \
+    "${opts:+ $cyan$opts$reset}" "$cyan" "$reset" >/dev/tty 2>/dev/null || true
+  read -r reply </dev/tty || true; printf '%s' "$reply"
+}
 yes()  { case "$(ask "$1")" in [nN]*) return 1 ;; *) return 0 ;; esac; }   # default yes
 no()   { case "$(ask "$1")" in [yY]*) return 1 ;; *) return 0 ;; esac; }   # default no
 have() { command -v "$1" >/dev/null 2>&1; }
@@ -143,7 +154,7 @@ cv_contact_name() {  # cv_contact_name <token> <user ID>: that user's name, or n
 read_token() {
   local c
   PAT=""
-  printf '  Token (hidden): '
+  printf '\n  %s?%s %sPaste the token%s %s(hidden)%s %s›%s ' "$bold$cyan" "$reset" "$bold" "$reset" "$dim" "$reset" "$cyan" "$reset"
   while IFS= read -rsn1 c </dev/tty; do
     case "$c" in
       "") break ;;
@@ -492,7 +503,7 @@ if [[ -n "$CREATOR" && -n "$PAT" && "$CREATOR" != "$(json "$WORK/whoami.json" 'd
     if yes "$Q"; then
       node -e '
         const fs = require("fs"), f = process.argv[1], id = process.argv[2]; let a = {};
-        try { a = JSON.parse(fs.readFileSync(f, "utf8")); } catch (e) { a = { dmPolicy: "allowlist", allowFrom: [], blockedFrom: [] }; }
+        try { a = JSON.parse(fs.readFileSync(f, "utf8")); } catch (e) { a = { dmPolicy: "pairing", allowFrom: [], blockedFrom: [] }; }
         if ((a.blockedFrom || []).includes(id)) process.exit(3);
         a.allowFrom = [...new Set([...(a.allowFrom || []), id])];
         fs.writeFileSync(f, JSON.stringify(a, null, 2) + "\n", { mode: 0o600 });
@@ -595,13 +606,9 @@ printf '  %-20s %s\n' "Who can message it:" "$([ -n "$OWNER_ALLOWED" ] && echo "
 printf '  %-20s %s\n' "Start it with:" "$(hl ./cv-run.sh)  (or $(hl "./cv-run.sh -- --continue") to pick up where you left off)"
 printf '  %-20s %s\n' "Update with:" "$(hl ./cv-update.sh)"
 echo
-# The Terminal window, not stdin: under `curl | bash` stdin is the script itself.
-if { : </dev/tty; } 2>/dev/null; then
-  ask "  Press Return to start Claude now, or Ctrl+C to start it later." >/dev/null
-  cd "$DIR"; rm -rf "$WORK"; trap - EXIT
-  exec ./cv-run.sh </dev/tty
-fi
-echo "  To start it: $(hl "cd $(shown "$DIR") && ./cv-run.sh")"
+# The user starts Claude themselves. Starting it from here (exec ./cv-run.sh </dev/tty) froze
+# Claude under `curl ... | bash`.
+echo "  Start it now: $(hl "cd $(shown "$DIR") && ./cv-run.sh")"
 echo
 }
 
