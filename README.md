@@ -17,6 +17,47 @@ If your computer is offline, messages queue and are delivered when the connectio
 
 ## Setup
 
+### Quick setup: one command in your project's folder
+
+You'll need a Claude Pro, Max, Team or Enterprise plan (Claude Code itself is installed for you if
+you don't have it yet), and a Personal Agent Account in Carbon Voice for Claude to talk as, with its
+Personal Access Token.
+In Terminal, go to your project's folder and run:
+
+```
+curl -fsSL https://raw.githubusercontent.com/PhononX/cv-claude-channels/main/cv-install.sh | bash
+```
+
+It shows what it will do and waits for your OK, then:
+
+1. Installs Node.js 18 or later if it's missing (the plugin runs on it): with Homebrew if you
+   have it, otherwise into `~/.local`, no password needed. Then installs Claude Code if it's
+   missing and signs it in to your Claude account, or offers to update it. Channels are new and
+   improving quickly, so the latest version works best.
+2. Installs the `cv-channel` plugin, or updates it.
+3. Asks for the Agent Account's token, checks it with Carbon Voice, and saves it for this folder,
+   outside the project in `~/.config/cv-channel/projects/`. If you created the Agent Account, it
+   offers to let your own account message it without a pairing code.
+4. Adds `./cv-run.sh`, which starts Claude here connected to Carbon Voice with the right flag for
+   your plan, and `./cv-update.sh`. In `.claude/settings.local.json` (your personal settings for
+   this project) it lets Claude use the channel's tools without asking, and keeps Claude from
+   reading the token: Claude reads only inside this folder, and asks before a command reads
+   anywhere else. To give Claude another folder, type `/add-dir <folder>` in Claude.
+
+Then, day to day:
+
+| Command | What it does |
+| --- | --- |
+| `./cv-run.sh` | Starts Claude here, connected to Carbon Voice. It first says what to expect: who can message it, the development-channel warning to accept on Pro/Max, and any updates available. |
+| `./cv-run.sh -- --continue` | Anything after `--` goes to Claude, here to pick up your last conversation. |
+| `./cv-update.sh` | Updates Claude Code, the plugin and both scripts, keeping your token and answers. `./cv-run.sh` tells you when there's an update. |
+| `./cv-run.sh --background` | Keeps running after you close the window (needs tmux). Run it again to reconnect. |
+| `./cv-run.sh --help` | Lists the other options: `--no-remote`, `--reset-token`, `--log on\|off\|show`. |
+
+Each folder set up this way is its own agent, with its own token, and its own allowlist in `.cv/`
+(added to `.gitignore`; the `CV_*_PATH` variables below point there). The rest of this section is
+the manual way to do the same.
+
 ### Before you start: you need two Carbon Voice accounts
 
 The Personal Access Token identifies the **Claude side** of the conversation. Messages from that account are treated as Claude's own and are ignored, so **you cannot message the channel from the account whose token you used** — nothing will arrive, and there is no error.
