@@ -33,7 +33,18 @@ ok()   { printf '  %s✓%s %s\n' "$green" "$reset" "$1"; }
 info() { printf '  %s%s%s\n' "$dim" "$1" "$reset"; }
 warn() { printf '  %s!%s %s\n' "$yellow" "$reset" "$1"; }
 die()  { printf '\n%s✗ %s%s\n' "$red" "$1" "$reset" >&2; exit 1; }
-ask()  { local reply; read -r -p "$1 " reply </dev/tty || true; printf '%s' "$reply"; }
+# Questions stand out from the output around them: a blank line, a cyan marker, the question in
+# bold and the choices in cyan. The prompt goes straight to the terminal, so $(ask ...) captures
+# only the reply. When piped from curl, stdin is this script, so answers come from the terminal.
+ask() {
+  local q=$1 lead opts="" mark="?" reply re='^(.*[^ ]) +(\[[^]]*\]):?$'
+  lead=${q%%[! ]*}; q=${q#"$lead"}
+  if [[ $q =~ $re ]]; then q=${BASH_REMATCH[1]}; opts=${BASH_REMATCH[2]}; fi
+  if [[ -z "$opts" && "$q" != *"?"* ]]; then mark="↵"; fi
+  printf '\n%s%s%s%s %s%s%s%s %s›%s ' "$lead" "$bold$cyan" "$mark" "$reset" "$bold" "$q" "$reset" \
+    "${opts:+ $cyan$opts$reset}" "$cyan" "$reset" >/dev/tty 2>/dev/null || true
+  read -r reply </dev/tty || true; printf '%s' "$reply"
+}
 yes()  { case "$(ask "$1")" in [nN]*) return 1 ;; *) return 0 ;; esac; }   # default yes
 no()   { case "$(ask "$1")" in [yY]*) return 1 ;; *) return 0 ;; esac; }   # default no
 have() { command -v "$1" >/dev/null 2>&1; }
@@ -143,7 +154,7 @@ cv_contact_name() {  # cv_contact_name <token> <user ID>: that user's name, or n
 read_token() {
   local c
   PAT=""
-  printf '  Token (hidden): '
+  printf '\n  %s?%s %sPaste the token%s %s(hidden)%s %s›%s ' "$bold$cyan" "$reset" "$bold" "$reset" "$dim" "$reset" "$cyan" "$reset"
   while IFS= read -rsn1 c </dev/tty; do
     case "$c" in
       "") break ;;
