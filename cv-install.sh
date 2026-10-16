@@ -562,11 +562,10 @@ if node -e '
 else
   warn "Couldn't read .claude/settings.local.json, so it was left as it was. Claude will ask before using Carbon Voice."
 fi
-if git -C "$DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1 </dev/null || [[ -f "$DIR/.gitignore" ]]; then
-  touch "$DIR/.gitignore"
-  grep -qxF '.cv/' "$DIR/.gitignore" || printf '\n# Carbon Voice channel state (cv-install.sh)\n.cv/\n' >> "$DIR/.gitignore"
-  ok ".cv/, this folder's Carbon Voice state, is in .gitignore"
-fi
+# Even outside git for now: a later `git init && git add .` would pick up the allowlist.
+touch "$DIR/.gitignore"
+grep -qxF '.cv/' "$DIR/.gitignore" || printf '\n# Carbon Voice channel state (cv-install.sh)\n.cv/\n' >> "$DIR/.gitignore"
+ok ".cv/, this folder's Carbon Voice state, is in .gitignore"
 {
   echo "# Answers to cv-install.sh, reused by ./cv-update.sh. You can edit them (1 = yes, 0 = no)."
   echo "AGENT_NAME=$AGENT_NAME"
