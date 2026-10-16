@@ -241,7 +241,7 @@ let connection: CVConnection | null = null
 const mcp = new Server(
   // Slug, not a display name: Claude Code derives the <channel source="..."> attribute
   // from this, so it has to be a valid identifier.
-  { name: 'cv-channel', version: '0.3.0' },
+  { name: 'cv-channel', version: '0.3.2' },
   {
     capabilities: {
       experimental: {
