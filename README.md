@@ -19,8 +19,8 @@ If your computer is offline, messages queue and are delivered when the connectio
 
 ### Quick setup: one command in your project's folder
 
-You'll need Claude Code (signed in with a Pro, Max, Team or Enterprise plan), Node.js 18 or later,
-and a Personal Agent Account in Carbon Voice for Claude to talk as, with its Personal Access Token.
+You'll need Claude Code (signed in with a Pro, Max, Team or Enterprise plan) and a Personal Agent
+Account in Carbon Voice for Claude to talk as, with its Personal Access Token.
 In Terminal, go to your project's folder and run:
 
 ```
@@ -29,15 +29,17 @@ In Terminal, go to your project's folder and run:
 
 It shows what it will do and waits for your OK, then:
 
-1. Checks Claude Code, and offers to update it. Channels are new and improving quickly, so the
-   latest version works best.
+1. Installs Node.js 18 or later if it's missing (the plugin runs on it): with Homebrew if you
+   have it, otherwise into `~/.local`, no password needed. Then checks Claude Code, and offers to
+   update it. Channels are new and improving quickly, so the latest version works best.
 2. Installs the `cv-channel` plugin, or updates it.
 3. Asks for the Agent Account's token, checks it with Carbon Voice, and saves it in this folder
    (`.cv/`, added to `.gitignore`). If you created the Agent Account, it offers to let your own
    account message it without a pairing code.
-4. Adds `./cv-run.sh`, which starts Claude here connected to Carbon Voice, with the right flag for
-   your plan. It also lets Claude use the channel's tools without asking, and keeps it from reading
-   the token, in `.claude/settings.local.json` (your personal settings for this project).
+4. Adds `./cv-run.sh`, which starts Claude here connected to Carbon Voice with the right flag for
+   your plan, and `./cv-update.sh`. It also lets Claude use the channel's tools without asking, and
+   keeps it from reading the token, in `.claude/settings.local.json` (your personal settings for
+   this project).
 
 Then, day to day:
 
@@ -45,7 +47,7 @@ Then, day to day:
 | --- | --- |
 | `./cv-run.sh` | Starts Claude here, connected to Carbon Voice. It first says what to expect: who can message it, the development-channel warning to accept on Pro/Max, and any updates available. |
 | `./cv-run.sh -- --continue` | Anything after `--` goes to Claude, here to pick up your last conversation. |
-| `./cv-run.sh --update` | Updates Claude Code, the plugin and `cv-run.sh`, keeping your token and answers. |
+| `./cv-update.sh` | Updates Claude Code, the plugin and both scripts, keeping your token and answers. `./cv-run.sh` tells you when there's an update. |
 | `./cv-run.sh --background` | Keeps running after you close the window (needs tmux). Run it again to reconnect. |
 | `./cv-run.sh --help` | Lists the other options: `--no-remote`, `--reset-token`, `--log on\|off\|show`. |
 

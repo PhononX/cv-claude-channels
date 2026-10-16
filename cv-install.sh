@@ -6,11 +6,11 @@
 #
 # It checks Claude Code (and offers to update it, since channel support changes quickly),
 # installs or updates the cv-channel plugin, saves your Carbon Voice Agent Account's token in
-# this folder, and writes ./cv-run.sh, which starts Claude here connected to Carbon Voice with
-# the right options for your Claude plan. Nothing else in the project changes.
+# this folder, and writes two scripts there. Nothing else in the project changes.
 #
-#   ./cv-run.sh            start Claude connected to Carbon Voice
-#   ./cv-run.sh --update   update Claude Code, the plugin and cv-run.sh (runs this as --update)
+#   ./cv-run.sh      start Claude here, connected to Carbon Voice, with the right options for
+#                    your Claude plan
+#   ./cv-update.sh   update Claude Code, the plugin and both scripts (runs this as --update)
 #
 # Safe to run again. Everything runs inside main(), called on the last line, so bash has read
 # the whole file before anything runs, and child commands get </dev/null or </dev/tty so none
@@ -22,6 +22,8 @@ MARKETPLACE="PhononX/claude-plugins"
 PLUGIN="cv-channel@carbonvoice"
 CV_API="https://api.carbonvoice.app"
 NODE_MIN=18
+BIN="$HOME/.local/bin"
+NODE_HOME="$HOME/.local/node"
 
 bold=$'\033[1m'; dim=$'\033[2m'; green=$'\033[32m'; yellow=$'\033[33m'; red=$'\033[31m'; cyan=$'\033[36m'; reset=$'\033[0m'
 hl()   { printf '%s%s%s' "$bold$cyan" "$1" "$reset"; }   # something to type or choose
@@ -62,6 +64,39 @@ latest_version() {  # latest_version <npm package>: newest published version, or
 }
 claude_version() { local v; v=$(claude --version </dev/null 2>/dev/null | head -1 || true); printf '%s' "${v%% *}"; }
 node_ok() { have node && [[ "$(node -p 'process.versions.node.split(".")[0]' </dev/null 2>/dev/null || echo 0)" -ge $NODE_MIN ]]; }
+sha256() { if have shasum; then shasum -a 256 "$1" | cut -d' ' -f1; else sha256sum "$1" | cut -d' ' -f1; fi; }
+# install_node: Node.js with Homebrew when it's there, otherwise the current LTS release from
+# nodejs.org, checked against its published checksum, into ~/.local (no password needed).
+install_node() {
+  local os arch ver pkg tmp expected rc
+  if have brew; then
+    info "Installing Node.js with Homebrew..."
+    quiet brew install node || die "Homebrew couldn't install Node.js. The details are in $(shown "$LOG")."
+  else
+    case "$(uname -s)" in Darwin) os=darwin ;; Linux) os=linux ;; *) die "Install Node.js from https://nodejs.org, then run this again." ;; esac
+    case "$(uname -m)" in arm64|aarch64) arch=arm64 ;; x86_64|amd64) arch=x64 ;; *) die "Install Node.js from https://nodejs.org, then run this again." ;; esac
+    # index.tab lists releases newest first; column 10 is the LTS name, or "-".
+    ver=$(curl -fsSL https://nodejs.org/dist/index.tab 2>>"$LOG" </dev/null | awk -F'\t' 'NR > 1 && $10 != "-" { print $1; exit }')
+    [[ "$ver" == v* ]] || die "Couldn't find the current Node.js release. Install it from https://nodejs.org, then run this again."
+    pkg="node-$ver-$os-$arch"; tmp=$(mktemp -d "$WORK/node.XXXXXX")
+    info "Downloading Node.js $ver..."
+    { curl -fsSL -o "$tmp/node.tar.gz" "https://nodejs.org/dist/$ver/$pkg.tar.gz" \
+        && curl -fsSL -o "$tmp/sums" "https://nodejs.org/dist/$ver/SHASUMS256.txt"; } </dev/null 2>>"$LOG" \
+      || die "Couldn't download Node.js. Check your internet connection and run this again."
+    expected=$(grep " $pkg.tar.gz\$" "$tmp/sums" | cut -d' ' -f1)
+    [[ -n "$expected" && "$(sha256 "$tmp/node.tar.gz")" == "$expected" ]] || die "The Node.js download failed its checksum. Run this again."
+    rm -rf "$NODE_HOME"; mkdir -p "$NODE_HOME" "$BIN"
+    tar -xzf "$tmp/node.tar.gz" -C "$NODE_HOME" --strip-components=1
+    for b in node npm npx; do ln -sf "$NODE_HOME/bin/$b" "$BIN/$b"; done
+    # So new Terminal windows, and Claude started from them, find it too.
+    rc=$([ "$(uname -s)" = Darwin ] && echo "$HOME/.zshrc" || echo "$HOME/.bashrc")
+    grep -qs '.local/bin' "$rc" || printf '\n# Added by cv-install.sh (Node.js for Carbon Voice)\nexport PATH="$HOME/.local/bin:$PATH"\n' >> "$rc"
+  fi
+  hash -r
+  node_ok || die "Node.js didn't install correctly. Install it from https://nodejs.org, then run this again."
+  ok "Node.js $(node --version)"
+}
+
 
 # Claude sign-in, from `claude auth status` (JSON), checked without ANTHROPIC_API_KEY the way
 # cv-run.sh starts Claude. Written to a file and read back: on macOS, output to a pipe can be
@@ -117,10 +152,9 @@ cv_run_template() {
 cat <<'TEMPLATE'
 #!/usr/bin/env bash
 # Starts Claude Code in this folder, connected to Carbon Voice as {{AGENT_NAME}}.
-# Written by cv-install.sh (https://github.com/PhononX/cv-claude-channels); --update rebuilds it.
+# Written by cv-install.sh (https://github.com/PhononX/cv-claude-channels); ./cv-update.sh rebuilds it.
 #   ./cv-run.sh                    start Claude here, connected to Carbon Voice
 #   ./cv-run.sh -- <options>       pass options to Claude, e.g. ./cv-run.sh -- --continue
-#   ./cv-run.sh --update           update Claude Code, the Carbon Voice plugin and this script
 #   ./cv-run.sh --background       keep running after the window closes (needs tmux);
 #                                  run the same command again to reconnect
 #   ./cv-run.sh --no-remote        don't show this session in the Claude app this time
@@ -142,11 +176,8 @@ while [[ $# -gt 0 ]]; do
         *)   if [[ -f .cv/channel.log ]]; then tail -n 40 .cv/channel.log; else echo "No log yet. Turn it on with ./cv-run.sh --log on, then start again."; fi ;;
       esac
       exit 0 ;;
-    --update)
-      SCRIPT=$(curl -fsSL {{INSTALL_URL}}) \
-        || { echo "Couldn't download the update. Check your internet connection and try again."; exit 1; }
-      exec /bin/bash -c "$SCRIPT" cv-install --update "$PWD" ;;
-    -h|--help) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --update) echo "To update, run ./cv-update.sh"; exit 1 ;;
+    -h|--help) awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"; echo "To update everything: ./cv-update.sh"; exit 0 ;;
     --) shift; EXTRA=("$@"); break ;;
     *) echo "Unknown option: $1. Run ./cv-run.sh --help to see the options."; exit 1 ;;
   esac
@@ -201,7 +232,7 @@ b=$'\033[1m'; c=$'\033[1;36m'; y=$'\033[33m'; r=$'\033[0m'
 ALLOWED=$(node -e 'try{const a=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));process.stdout.write(String((a.allowFrom||[]).length))}catch(e){process.stdout.write("0")}' "$CV_ACCESS_PATH" 2>/dev/null || echo 0)
 echo
 echo "${b}Starting Claude in this folder, connected to Carbon Voice as {{AGENT_NAME}}.${r}"
-if [[ -n "$UPDATES" ]]; then echo "  ${y}Update available:${r} $UPDATES. Run ${c}./cv-run.sh --update${r} when you can."; fi
+if [[ -n "$UPDATES" ]]; then echo "  ${y}Update available:${r} $UPDATES. Run ${c}./cv-update.sh${r} when you can."; fi
 if [[ "$ALLOWED" -gt 0 ]]; then
   if [[ "$ALLOWED" == 1 ]]; then WHO="the account you've allowed"; else WHO="the $ALLOWED accounts you've allowed"; fi
   echo "  • Messages to {{AGENT_NAME}} in Carbon Voice from $WHO reach Claude here."
@@ -231,6 +262,20 @@ fi
 exec "${CMD[@]}"
 TEMPLATE
 }
+# ---------- ./cv-update.sh ----------
+cv_update_template() {
+cat <<'TEMPLATE'
+#!/usr/bin/env bash
+# Updates Claude Code, the Carbon Voice plugin (cv-channel), ./cv-run.sh and this script to the
+# latest versions, keeping this folder's Carbon Voice token and your answers to setup.
+# Written by cv-install.sh (https://github.com/PhononX/cv-claude-channels).
+set -euo pipefail
+cd "$(dirname "$0")"
+SCRIPT=$(curl -fsSL {{INSTALL_URL}}) \
+  || { echo "Couldn't download the update. Check your internet connection and try again."; exit 1; }
+exec /bin/bash -c "$SCRIPT" cv-install --update "$PWD"
+TEMPLATE
+}
 # fill <template file> <dest> KEY=value...: copies a template, replacing each {{KEY}} literally.
 fill() {
   local src=$1 dst=$2 keys="" kv; shift 2
@@ -253,9 +298,10 @@ printf '\n=== cv-install %s ===\n' "$(date)" >>"$LOG"
 MODE=install; DIR=$PWD
 if [[ "${1:-}" == --update ]]; then
   MODE=update; DIR=${2:-$PWD}
-  [[ -d "$DIR" ]] || die "Run ./cv-run.sh --update from inside your project's folder."
+  [[ -d "$DIR" ]] || die "Run ./cv-update.sh from inside your project's folder."
   DIR=$(cd "$DIR" && pwd)
 fi
+export PATH="$BIN:$PATH"
 CV_DIR="$DIR/.cv"
 [[ "$DIR" != / ]] || die "Run this from inside your project's folder, not the top of the disk."
 [[ -w "$DIR" ]] || die "Can't write to $(shown "$DIR"). Run this from a project folder you own."
@@ -267,27 +313,34 @@ fi
 have claude || die "Claude Code isn't installed. Install it first, then run this again:
     curl -fsSL https://claude.ai/install.sh | bash
   More at https://code.claude.com/docs"
-node_ok || die "The Carbon Voice plugin needs Node.js $NODE_MIN or later, and $(have node && echo "this computer has $(node --version)" || echo "it isn't installed").
-  Install it from https://nodejs.org (or, with Homebrew: brew install node), then run this again."
 have curl || die "This needs curl, which isn't installed."
+NEED_NODE=""; node_ok || NEED_NODE=1
 
 clear 2>/dev/null || true
 if [[ $MODE == update ]]; then
   printf '%sCarbon Voice for Claude Code — update%s\n\n' "$bold" "$reset"
-  echo "This updates Claude Code, the Carbon Voice plugin and ./cv-run.sh for $(val "$(shown "$DIR")")."
+  echo "This updates Claude Code, the Carbon Voice plugin, ./cv-run.sh and ./cv-update.sh for $(val "$(shown "$DIR")")."
   echo "Your token and answers are kept."
 else
   printf '%sCarbon Voice for Claude Code%s\n\n' "$bold" "$reset"
   echo "This connects Carbon Voice to the Claude Code project in $(val "$(shown "$DIR")"), so you can"
   echo "talk to Claude here through a Carbon Voice agent. It will:"
+  if [[ -n "$NEED_NODE" ]]; then
+    echo "  0. Install Node.js, which the Carbon Voice plugin runs on ($(have node && echo "this computer has $(node --version), and it needs $NODE_MIN or later" || echo "it isn't installed"))."
+  fi
   echo "  1. Check Claude Code is up to date, and offer to update it."
   echo "  2. Install or update the Carbon Voice plugin (cv-channel)."
   echo "  3. Ask for your Carbon Voice Agent Account's token, and save it in this folder (.cv/)."
-  echo "  4. Add ./cv-run.sh, which starts Claude here connected to Carbon Voice."
+  echo "  4. Add ./cv-run.sh, which starts Claude here connected to Carbon Voice, and ./cv-update.sh."
   echo "Nothing else in the project changes."
 fi
 echo
 yes "Continue? [Y/n]" || { echo "No changes made."; exit 0; }
+
+if [[ -n "$NEED_NODE" ]]; then
+  step "Node.js"
+  install_node
+fi
 
 # ---------- 1. Claude Code ----------
 step "Claude Code"
@@ -303,7 +356,7 @@ else
     if claude update </dev/null >>"$LOG" 2>&1; then ok "Claude Code $(claude_version)"
     else warn "Couldn't update Claude Code (the details are in $(shown "$LOG")). Continuing with $HAVE_V."; fi
   else
-    info "Kept $HAVE_V. Run ./cv-run.sh --update any time."
+    info "Kept $HAVE_V. Run ./cv-update.sh any time."
   fi
 fi
 
@@ -447,10 +500,14 @@ SCRIPT_NAME=$(printf '%s' "$AGENT_NAME" | tr -d '"$`\\')
 cv_run_template > "$WORK/cv-run.template"
 fill "$WORK/cv-run.template" "$WORK/cv-run.sh" AGENT_NAME="$SCRIPT_NAME" CLAUDE_BIN="$(command -v claude)" \
   CHANNEL_ARGS="$CHANNEL_ARGS" REMOTE_ARGS="$REMOTE_ARGS" INSTALL_URL="$INSTALL_URL"
-if [[ -e "$DIR/cv-run.sh" ]] && ! cmp -s "$WORK/cv-run.sh" "$DIR/cv-run.sh"; then cp "$DIR/cv-run.sh" "$DIR/cv-run.sh.bak"; fi
-mv "$WORK/cv-run.sh" "$DIR/cv-run.sh"; chmod +x "$DIR/cv-run.sh"
+cv_update_template > "$WORK/cv-update.template"
+fill "$WORK/cv-update.template" "$WORK/cv-update.sh" INSTALL_URL="$INSTALL_URL"
+for f in cv-run.sh cv-update.sh; do
+  if [[ -e "$DIR/$f" ]] && ! cmp -s "$WORK/$f" "$DIR/$f"; then cp "$DIR/$f" "$DIR/$f.bak"; fi
+  mv "$WORK/$f" "$DIR/$f"; chmod +x "$DIR/$f"
+done
 rm -f "$CV_DIR/.update-check"
-ok "./cv-run.sh starts Claude here, connected to Carbon Voice"
+ok "./cv-run.sh starts Claude here, connected to Carbon Voice; ./cv-update.sh updates it all"
 # In this project only, and only for you (.claude/settings.local.json isn't shared): Carbon
 # Voice's own tools run without asking, and Claude can't read or change the token.
 mkdir -p "$DIR/.claude"
@@ -474,7 +531,7 @@ if git -C "$DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1 </dev/null || [
   ok ".cv/ is in .gitignore, so the token stays out of git"
 fi
 {
-  echo "# Answers to cv-install.sh, reused by ./cv-run.sh --update. You can edit them (1 = yes, 0 = no)."
+  echo "# Answers to cv-install.sh, reused by ./cv-update.sh. You can edit them (1 = yes, 0 = no)."
   echo "AGENT_NAME=$AGENT_NAME"
   echo "TEAM=$TEAM"
   echo "REMOTE=${REMOTE:-0}"
@@ -492,7 +549,7 @@ step "Carbon Voice is connected to this project."
 printf '  %-20s %s\n' "Carbon Voice agent:" "$(val "$AGENT_NAME")"
 printf '  %-20s %s\n' "Who can message it:" "$([ -n "$OWNER_ALLOWED" ] && echo "${green}your Carbon Voice account$reset" || echo "${yellow}nobody yet: you'll pair your account with a code$reset")"
 printf '  %-20s %s\n' "Start it with:" "$(hl ./cv-run.sh)  (or $(hl "./cv-run.sh -- --continue") to pick up where you left off)"
-printf '  %-20s %s\n' "Update with:" "$(hl "./cv-run.sh --update")"
+printf '  %-20s %s\n' "Update with:" "$(hl ./cv-update.sh)"
 echo
 if [[ -t 0 ]]; then
   ask "  Press Return to start Claude now, or Ctrl+C to start it later." >/dev/null
