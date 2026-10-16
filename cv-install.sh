@@ -36,6 +36,15 @@ die()  { printf '\n%s✗ %s%s\n' "$red" "$1" "$reset" >&2; exit 1; }
 ask()  { local reply; read -r -p "$1 " reply </dev/tty || true; printf '%s' "$reply"; }
 yes()  { case "$(ask "$1")" in [nN]*) return 1 ;; *) return 0 ;; esac; }   # default yes
 no()   { case "$(ask "$1")" in [yY]*) return 1 ;; *) return 0 ;; esac; }   # default no
+# For questions about who can message the agent, Return alone isn't an answer: ask again.
+yn()   {
+  local i
+  for i in 1 2 3; do
+    case "$(ask "$1")" in [yY]*) return 0 ;; [nN]*) return 1 ;; esac
+    info "Type y or n, then press Return."
+  done
+  info "No answer, so no."; return 1
+}
 have() { command -v "$1" >/dev/null 2>&1; }
 quiet() { "$@" </dev/null >>"$LOG" 2>&1; }
 shown() { case "$1" in "$HOME") printf '~' ;; "$HOME"/*) printf '~/%s' "${1#"$HOME"/}" ;; *) printf '%s' "$1" ;; esac; }
@@ -487,12 +496,12 @@ if [[ -n "$CREATOR" && -n "$PAT" && "$CREATOR" != "$(json "$WORK/whoami.json" 'd
     OWNER_ALLOWED=1
   elif [[ "$ALLOW_CREATOR" != 0 || $MODE == install ]]; then
     NAME=$(cv_contact_name "$PAT" "$CREATOR")
-    if [[ -n "$NAME" ]]; then Q="  $NAME created this Agent Account. Let $NAME message $AGENT_NAME without a pairing code? [Y/n]"
-    else Q="  This Agent Account was created by the Carbon Voice account $CREATOR. Is that you? If so, it can skip pairing. [Y/n]"; fi
-    if yes "$Q"; then
+    if [[ -n "$NAME" ]]; then Q="  $NAME created this Agent Account. Let $NAME message $AGENT_NAME without a pairing code? [y/n]"
+    else Q="  This Agent Account was created by the Carbon Voice account $CREATOR. Is that you? If so, it can skip pairing. [y/n]"; fi
+    if yn "$Q"; then
       node -e '
         const fs = require("fs"), f = process.argv[1], id = process.argv[2]; let a = {};
-        try { a = JSON.parse(fs.readFileSync(f, "utf8")); } catch (e) { a = { dmPolicy: "allowlist", allowFrom: [], blockedFrom: [] }; }
+        try { a = JSON.parse(fs.readFileSync(f, "utf8")); } catch (e) { a = { dmPolicy: "pairing", allowFrom: [], blockedFrom: [] }; }
         if ((a.blockedFrom || []).includes(id)) process.exit(3);
         a.allowFrom = [...new Set([...(a.allowFrom || []), id])];
         fs.writeFileSync(f, JSON.stringify(a, null, 2) + "\n", { mode: 0o600 });
