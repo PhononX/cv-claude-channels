@@ -4,8 +4,8 @@
 # In Terminal, go to your project's folder and run:
 #   /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/PhononX/cv-claude-channels/main/cv-install.sh)"
 #
-# It checks Claude Code (and offers to update it, since channel support changes quickly),
-# installs or updates the cv-channel plugin, saves your Carbon Voice Agent Account's token in
+# It installs Claude Code if it's missing (or offers to update it, since channel support changes
+# quickly), installs or updates the cv-channel plugin, saves your Carbon Voice Agent Account's token in
 # this folder, and writes two scripts there. Nothing else in the project changes.
 #
 #   ./cv-run.sh      start Claude here, connected to Carbon Voice, with the right options for
@@ -88,13 +88,29 @@ install_node() {
     rm -rf "$NODE_HOME"; mkdir -p "$NODE_HOME" "$BIN"
     tar -xzf "$tmp/node.tar.gz" -C "$NODE_HOME" --strip-components=1
     for b in node npm npx; do ln -sf "$NODE_HOME/bin/$b" "$BIN/$b"; done
-    # So new Terminal windows, and Claude started from them, find it too.
-    rc=$([ "$(uname -s)" = Darwin ] && echo "$HOME/.zshrc" || echo "$HOME/.bashrc")
-    grep -qs '.local/bin' "$rc" || printf '\n# Added by cv-install.sh (Node.js for Carbon Voice)\nexport PATH="$HOME/.local/bin:$PATH"\n' >> "$rc"
+    path_in_rc
   fi
   hash -r
   node_ok || die "Node.js didn't install correctly. Install it from https://nodejs.org, then run this again."
   ok "Node.js $(node --version)"
+}
+# install_claude: Claude Code from Anthropic's installer, into ~/.local/bin (no password needed).
+# Downloaded first, so a failed download can't run as an empty script that "succeeds".
+install_claude() {
+  info "Installing Claude Code..."
+  curl -fsSL -o "$WORK/claude-install.sh" https://claude.ai/install.sh </dev/null 2>>"$LOG" \
+    || die "Couldn't download Claude Code. Check your internet connection and run this again."
+  quiet bash "$WORK/claude-install.sh" || die "Claude Code didn't install. The details are in $(shown "$LOG")."
+  hash -r
+  have claude || die "Claude Code didn't install. The details are in $(shown "$LOG")."
+  path_in_rc
+  ok "Claude Code $(claude_version)"
+}
+# So new Terminal windows, and Claude started from them, find what's in ~/.local/bin.
+path_in_rc() {
+  local rc
+  rc=$([ "$(uname -s)" = Darwin ] && echo "$HOME/.zshrc" || echo "$HOME/.bashrc")
+  grep -qs '.local/bin' "$rc" || printf '\n# Added by cv-install.sh (Carbon Voice for Claude Code)\nexport PATH="$HOME/.local/bin:$PATH"\n' >> "$rc"
 }
 
 
@@ -310,11 +326,9 @@ if [[ -f "$DIR/cos/.version" ]]; then
 fi
 
 # ---------- what's here, before changing anything ----------
-have claude || die "Claude Code isn't installed. Install it first, then run this again:
-    curl -fsSL https://claude.ai/install.sh | bash
-  More at https://code.claude.com/docs"
 have curl || die "This needs curl, which isn't installed."
 NEED_NODE=""; node_ok || NEED_NODE=1
+NEED_CLAUDE=""; have claude || NEED_CLAUDE=1
 
 clear 2>/dev/null || true
 if [[ $MODE == update ]]; then
@@ -328,7 +342,11 @@ else
   if [[ -n "$NEED_NODE" ]]; then
     echo "  0. Install Node.js, which the Carbon Voice plugin runs on ($(have node && echo "this computer has $(node --version), and it needs $NODE_MIN or later" || echo "it isn't installed"))."
   fi
-  echo "  1. Check Claude Code is up to date, and offer to update it."
+  if [[ -n "$NEED_CLAUDE" ]]; then
+    echo "  1. Install Claude Code, and sign it in to your Claude account."
+  else
+    echo "  1. Check Claude Code is up to date, and offer to update it."
+  fi
   echo "  2. Install or update the Carbon Voice plugin (cv-channel)."
   echo "  3. Ask for your Carbon Voice Agent Account's token, and save it in this folder (.cv/)."
   echo "  4. Add ./cv-run.sh, which starts Claude here connected to Carbon Voice, and ./cv-update.sh."
@@ -344,19 +362,23 @@ fi
 
 # ---------- 1. Claude Code ----------
 step "Claude Code"
-HAVE_V=$(claude_version); LATEST_V=$(latest_version @anthropic-ai/claude-code)
-if [[ -n "$LATEST_V" && -n "$HAVE_V" ]] && version_ge "$HAVE_V" "$LATEST_V"; then
-  ok "Up to date ($HAVE_V)"
+if [[ -n "$NEED_CLAUDE" ]]; then
+  install_claude
 else
-  if [[ -n "$LATEST_V" ]]; then
-    info "You have ${HAVE_V:-an unknown version}; the latest is $LATEST_V. Carbon Voice uses Claude Code's channels,"
-    info "which are new and improving quickly, so the latest version works best."
-  fi
-  if [[ $MODE == update ]] || yes "  Update Claude Code now? [Y/n]"; then
-    if claude update </dev/null >>"$LOG" 2>&1; then ok "Claude Code $(claude_version)"
-    else warn "Couldn't update Claude Code (the details are in $(shown "$LOG")). Continuing with $HAVE_V."; fi
+  HAVE_V=$(claude_version); LATEST_V=$(latest_version @anthropic-ai/claude-code)
+  if [[ -n "$LATEST_V" && -n "$HAVE_V" ]] && version_ge "$HAVE_V" "$LATEST_V"; then
+    ok "Up to date ($HAVE_V)"
   else
-    info "Kept $HAVE_V. Run ./cv-update.sh any time."
+    if [[ -n "$LATEST_V" ]]; then
+      info "You have ${HAVE_V:-an unknown version}; the latest is $LATEST_V. Carbon Voice uses Claude Code's channels,"
+      info "which are new and improving quickly, so the latest version works best."
+    fi
+    if [[ $MODE == update ]] || yes "  Update Claude Code now? [Y/n]"; then
+      if claude update </dev/null >>"$LOG" 2>&1; then ok "Claude Code $(claude_version)"
+      else warn "Couldn't update Claude Code (the details are in $(shown "$LOG")). Continuing with $HAVE_V."; fi
+    else
+      info "Kept $HAVE_V. Run ./cv-update.sh any time."
+    fi
   fi
 fi
 
