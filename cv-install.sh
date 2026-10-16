@@ -2,7 +2,7 @@
 # Carbon Voice for Claude Code: connect a project folder.
 #
 # In Terminal, go to your project's folder and run:
-#   /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/PhononX/cv-claude-channels/main/cv-install.sh)"
+#   curl -fsSL https://raw.githubusercontent.com/PhononX/cv-claude-channels/main/cv-install.sh | bash
 #
 # It installs Claude Code if it's missing (or offers to update it, since channel support changes
 # quickly), installs or updates the cv-channel plugin, saves your Carbon Voice Agent Account's token in
@@ -573,7 +573,8 @@ printf '  %-20s %s\n' "Who can message it:" "$([ -n "$OWNER_ALLOWED" ] && echo "
 printf '  %-20s %s\n' "Start it with:" "$(hl ./cv-run.sh)  (or $(hl "./cv-run.sh -- --continue") to pick up where you left off)"
 printf '  %-20s %s\n' "Update with:" "$(hl ./cv-update.sh)"
 echo
-if [[ -t 0 ]]; then
+# The Terminal window, not stdin: under `curl | bash` stdin is the script itself.
+if { : </dev/tty; } 2>/dev/null; then
   ask "  Press Return to start Claude now, or Ctrl+C to start it later." >/dev/null
   cd "$DIR"; rm -rf "$WORK"; trap - EXIT
   exec ./cv-run.sh </dev/tty

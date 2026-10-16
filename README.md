@@ -25,7 +25,7 @@ Personal Access Token.
 In Terminal, go to your project's folder and run:
 
 ```
-/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/PhononX/cv-claude-channels/main/cv-install.sh)"
+curl -fsSL https://raw.githubusercontent.com/PhononX/cv-claude-channels/main/cv-install.sh | bash
 ```
 
 It shows what it will do and waits for your OK, then:
