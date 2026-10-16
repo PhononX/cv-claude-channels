@@ -206,7 +206,7 @@ CV_DIR="$PWD/.cv"
 mkdir -p "$CV_DIR" && chmod 700 "$CV_DIR"
 # The token is kept outside the project, where Claude can't read it without asking, and out of
 # Claude's environment, which every command Claude runs inherits: the plugin reads the file itself.
-TOKEN_FILE="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/channels/cv/projects/{{PROJECT_ID}}/.env"
+TOKEN_FILE="$HOME/.config/cv-channel/projects/{{PROJECT_ID}}/.env"
 if [[ $RESET == 1 ]]; then rm -f "$TOKEN_FILE"; fi
 if [[ ! -s "$TOKEN_FILE" ]]; then
   echo "Paste the Personal Access Token for your Carbon Voice Agent Account."
@@ -326,7 +326,8 @@ CV_DIR="$DIR/.cv"
 # Names this folder's token directory and background session: the folder's name, plus a checksum
 # of its full path so two folders with the same name don't collide.
 PROJECT_ID="$(printf '%s' "$(basename "$DIR")" | tr -c 'A-Za-z0-9_-' '-' | cut -c1-40)-$(printf '%s' "$DIR" | cksum | cut -d' ' -f1)"
-TOKEN_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/channels/cv/projects/$PROJECT_ID"
+# Not under ~/.claude, parts of which Claude Code keeps readable for itself.
+TOKEN_DIR="$HOME/.config/cv-channel/projects/$PROJECT_ID"
 TOKEN_FILE="$TOKEN_DIR/.env"
 [[ "$DIR" != / ]] || die "Run this from inside your project's folder, not the top of the disk."
 [[ -w "$DIR" ]] || die "Can't write to $(shown "$DIR"). Run this from a project folder you own."
@@ -544,7 +545,9 @@ done
 rm -f "$CV_DIR/.update-check"
 ok "./cv-run.sh starts Claude here, connected to Carbon Voice; ./cv-update.sh updates it all"
 # In this project only, and only for you (.claude/settings.local.json isn't shared): Carbon
-# Voice's own tools run without asking, and Claude can't read or change the token.
+# Voice's own tools run without asking, and Claude can't read or change the token. Deny rules
+# alone don't stop `grep -r` on a containing directory, so reads outside the project are blocked
+# too: file-reading commands there need approval, which reaches Carbon Voice as a prompt.
 mkdir -p "$DIR/.claude"
 case "$TOKEN_DIR" in "$HOME"/*) TOKEN_RULE="~/${TOKEN_DIR#"$HOME"/}/**" ;; *) TOKEN_RULE="/$TOKEN_DIR/**" ;; esac
 if node -e '
@@ -555,10 +558,15 @@ if node -e '
     add("allow", ["mcp__plugin_cv-channel_cv-channel__confirm_channels", "mcp__plugin_cv-channel_cv-channel__send_message",
                   "mcp__plugin_cv-channel_cv-channel__list_senders"]);
     const t = process.argv[2];
-    add("deny", [`Read(${t})`, `Edit(${t})`, `Write(${t})`, "Edit(./.cv/**)", "Write(./.cv/**)"]);
+    // Earlier versions wrote these; Write(path) rules are never consulted and warn at startup.
+    s.permissions.deny = (s.permissions.deny || []).filter(r =>
+      !["Read(./.cv/.env)", "Write(./.cv/**)"].includes(r) && !/^(Read|Edit|Write)\(~\/\.claude\/channels\/cv\/projects\//.test(r));
+    add("deny", [`Read(${t})`, `Edit(${t})`, "Edit(./.cv/**)"]);
+    s.permissions.blockReadsOutsideWorkingDirectories = true;
     fs.writeFileSync(f, JSON.stringify(s, null, 2) + "\n");
   ' "$DIR/.claude/settings.local.json" "$TOKEN_RULE" </dev/null; then
   ok "Claude can use Carbon Voice here without asking each time, and can't read the token"
+  info "Claude reads only inside this folder now; to give it another, type /add-dir <folder> in Claude."
 else
   warn "Couldn't read .claude/settings.local.json, so it was left as it was. Claude will ask before using Carbon Voice."
 fi

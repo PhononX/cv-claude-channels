@@ -36,13 +36,13 @@ It shows what it will do and waits for your OK, then:
    improving quickly, so the latest version works best.
 2. Installs the `cv-channel` plugin, or updates it.
 3. Asks for the Agent Account's token, checks it with Carbon Voice, and saves it for this folder,
-   outside the project in `~/.claude/channels/cv/projects/`, where Claude can't read it without
-   asking. If you created the Agent Account, it offers to let your own
-   account message it without a pairing code.
+   outside the project in `~/.config/cv-channel/projects/`. If you created the Agent Account, it
+   offers to let your own account message it without a pairing code.
 4. Adds `./cv-run.sh`, which starts Claude here connected to Carbon Voice with the right flag for
-   your plan, and `./cv-update.sh`. It also lets Claude use the channel's tools without asking, and
-   keeps it from reading the token, in `.claude/settings.local.json` (your personal settings for
-   this project).
+   your plan, and `./cv-update.sh`. In `.claude/settings.local.json` (your personal settings for
+   this project) it lets Claude use the channel's tools without asking, and keeps Claude from
+   reading the token: Claude reads only inside this folder, and asks before a command reads
+   anywhere else. To give Claude another folder, type `/add-dir <folder>` in Claude.
 
 Then, day to day:
 
