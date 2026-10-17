@@ -11,7 +11,7 @@ Published as `@carbonvoice/cv-claude-channel` on npm, and installable as the `cv
 ### Message Flow
 1. **Inbound**: Messages arrive from Carbon Voice via WebSocket (primary) or polling (fallback).
 2. **Deduplication**: Server-side reaction marker plus an in-memory cursor prevent duplicate processing.
-3. **Sender gating**: Deny-by-default allowlist. Under `dmPolicy: "pairing"` an unknown sender is replied to in CV with a 6-character code and the operator runs `/cv-channel:access pair <code>`; under `"allowlist"` they are dropped silently. Either way Claude is notified once per sender, and only the *operator* can act.
+3. **Sender gating**: Deny-by-default allowlist. Under `dmPolicy: "pairing"` an unknown sender is replied to in CV with a 6-character code and the operator runs `/cv-channel:access pair <code>`; under `"allowlist"` they are dropped silently. Under `allowlist` Claude is notified once per sender per session; under `pairing` each issued code is notified (a sender gets a fresh code after expiry, at most one per minute, three per session, and one per conversation while a code is live). Only the *operator* can act.
 4. **Claude receives**: As a `<channel>` tag with `channel_id`, `sender_id`, `message_id`, `reply_to_id`. The `source` attribute is set by Claude Code from the server name — do not set `source` in `meta`.
 5. **Claude replies**: Calls `send_message` with channel_id, reply_to_message_id, and text. CV auto-converts to audio.
 

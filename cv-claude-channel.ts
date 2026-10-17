@@ -55,7 +55,7 @@ import {
 } from './permission-relay.js'
 import { createActivitySignals } from './activity-signals.js'
 import { startupCheckDelay } from './startup-check.js'
-import { shouldIssuePairing } from './pairing-gate.js'
+import { shouldIssuePairing, type PairingHistory } from './pairing-gate.js'
 import { syncMessageUpdates } from './message-v6.js'
 import { canonicalReactionKey, collectReactors, hasReacted, isSingleEmoji } from './reactions.js'
 
@@ -206,7 +206,7 @@ interface State {
   accessMtimeMs: number                 // mtime of the last access file we loaded
   pendingPairings: Map<string, PendingPairing>  // code → pairing request (server-owned)
   unknownSenderSeen: Set<string>        // senders already notified this session (avoid spam)
-  pairingIssuedAt: Map<string, number>  // sender → when we last issued them a code
+  pairingHistory: Map<string, PairingHistory>  // sender → codes issued this session, for the reissue cap
   pendingAllowContext: Map<string, { channelId: string; messageId: string }>  // context for allow confirmation
   pendingAttachments: Map<string, { channelId: string; replyToId: string; senderId: string; deadline: number; nudgeAt: number; nudgeSent: boolean; filenames: string[]; createdAt: string }>
   attachmentFollowUpSent: Set<string>  // message IDs for which attachment follow-up has been sent
@@ -233,7 +233,7 @@ const state: State = {
   accessMtimeMs: 0,
   pendingPairings: new Map(),
   unknownSenderSeen: new Set(),
-  pairingIssuedAt: new Map(),
+  pairingHistory: new Map(),
   pendingAllowContext: new Map(),
   pendingAttachments: new Map(),
   attachmentFollowUpSent: new Set(),
@@ -617,6 +617,7 @@ async function refreshAccess() {
     for (const userId of state.access.allowFrom) {
       if (before.has(userId)) continue
       state.unknownSenderSeen.delete(userId)
+      state.pairingHistory.delete(userId)
       // Someone who messaged and was turned away gets told once that they're in now.
       const ctx = state.pendingAllowContext.get(userId)
       state.pendingAllowContext.delete(userId)
@@ -752,7 +753,6 @@ async function processMessage(event: CVMessageEvent): Promise<boolean | null> {
   // Sender gating: deny all senders not in the allowlist
   if (!state.access.allowFrom.includes(event.creator_id)) {
     log(`cv-claude-channels: dropped message from unknown sender ${event.creator_id}\n`)
-    // Notify Claude Code once per sender per session so the user can decide to allow them
     // Under pairing a sender is re-offered a code once the last one has lapsed; under
     // allowlist there is nothing to reissue, so the operator hears once per session.
     const pairing = state.access.dmPolicy === 'pairing'
@@ -760,20 +760,24 @@ async function processMessage(event: CVMessageEvent): Promise<boolean | null> {
     const notify = pairing
       ? shouldIssuePairing({
           senderId: event.creator_id,
+          channelId: channel_id,
           pending: state.pendingPairings.values(),
-          lastIssuedAt: state.pairingIssuedAt.get(event.creator_id),
+          history: state.pairingHistory.get(event.creator_id),
           now: Date.now(),
         })
       : !state.unknownSenderSeen.has(event.creator_id)
     if (notify) {
-      state.unknownSenderSeen.add(event.creator_id)
+      if (!pairing) state.unknownSenderSeen.add(event.creator_id)
       state.pendingAllowContext.set(event.creator_id, { channelId: channel_id, messageId: event.message_id })
 
       // Both branches address the operator, never Claude: allowing a sender also grants
       // them the power to approve tool calls, so it is never done on Claude's initiative.
       if (pairing) {
         const code = newPairingCode()
-        state.pairingIssuedAt.set(event.creator_id, Date.now())
+        state.pairingHistory.set(event.creator_id, {
+          lastAt: Date.now(),
+          count: (state.pairingHistory.get(event.creator_id)?.count ?? 0) + 1,
+        })
         const minutes = Math.round(PAIRING_TTL_MS / 60_000)
         state.pendingPairings.set(code, {
           senderId: event.creator_id,

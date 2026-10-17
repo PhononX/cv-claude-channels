@@ -18,6 +18,8 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const readJson = rel => JSON.parse(readFileSync(path.join(root, rel), 'utf8'))
 const versions = {
   'package.json': readJson('package.json').version,
+  'npm-shrinkwrap.json': readJson('npm-shrinkwrap.json').version,
+  'npm-shrinkwrap.json packages[""]': readJson('npm-shrinkwrap.json').packages?.['']?.version,
   '.claude-plugin/plugin.json': readJson('.claude-plugin/plugin.json').version,
   '.claude-plugin/marketplace.json': readJson('.claude-plugin/marketplace.json').plugins?.find(p => p.name === 'cv-channel')?.version,
 }

@@ -227,7 +227,7 @@ A relayed prompt expires after `CV_PERMISSION_TTL_MS` and can no longer be answe
 
 **Every sender is denied by default.** What an unknown sender sees depends on the access policy:
 
-- **`pairing`** (the default for new installs): the sender gets a reply in Carbon Voice with a 6-character code, valid for `CV_PAIRING_TTL_MS` (10 minutes). They give it to you and you run `/cv-channel:access pair <code>`. If the code expires, their next message gets a fresh one (at most one per minute).
+- **`pairing`** (the default for new installs): the sender gets a reply in Carbon Voice with a 6-character code, valid for `CV_PAIRING_TTL_MS` (10 minutes). They give it to you and you run `/cv-channel:access pair <code>`. If the code expires, their next message gets a fresh one (at most one per minute, three per sender per session).
 - **`allowlist`**: the sender is dropped silently and told nothing. An existing `access.json` that predates pairing migrates to this.
 
 Access is managed from the terminal with `/cv-channel:access`:
