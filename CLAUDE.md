@@ -143,6 +143,7 @@ output. Only the npm source is supported.
 ## Code Layout
 
 - **cv-claude-channel.ts** (main): MCP server setup, message loop, permission relay, sender gating, state persistence.
+- **pairing-gate.ts**: the pure decision for when an unknown sender is issued a (fresh) pairing code; tested in `pairing-gate.test.ts`.
 - **permission-relay.ts**: pure helpers — verdict parsing, prompt formatting, pending-request bookkeeping. Extracted so it is testable without booting the server.
 - **permission-relay.test.ts**: tests for the above.
 - **cv-api.ts** / **cv-api.test.ts**: CV API client wrapper.
@@ -242,7 +243,9 @@ Set `CV_LOG_FILE` and watch it. The relay logs: the request arriving, whether co
 npm publish   # prepublishOnly runs the build
 ```
 
-Bump `version` in **three** places, they must agree: `package.json`, `.claude-plugin/plugin.json`, and the `version` in the `Server` constructor. The marketplace entry's `version` should track it too.
+Bump `version` in `package.json`, `.claude-plugin/plugin.json`, `npm-shrinkwrap.json` and this repo's `.claude-plugin/marketplace.json`; the `Server` constructor reads `package.json`. `npm run smoke` fails if they disagree.
+
+`PhononX/claude-plugins` is the **canonical** marketplace — the README and both installers use it. This repo's `.claude-plugin/marketplace.json` is kept for people who added it directly, and duplicates the `cv-channel` entry there. Bump both together: after publishing, update the version in `claude-plugins/.claude-plugin/marketplace.json` too.
 
 ## Known Limitations
 
