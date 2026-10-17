@@ -113,6 +113,7 @@ Allowing someone lets them send messages Claude acts on **and** approve relayed 
 | `/mcp` shows the server failed | No token yet — run `/cv-channel:configure`. |
 | A pairing code comes back instead of an answer | Working as intended. Pair it (step 5). |
 | Startup says "blocked by org policy" | Your organization has not enabled channels; no flag gets around it. |
+| No pairing code comes back | An `access.json` from before pairing has no `dmPolicy`, so it migrates to `allowlist`. Run `/cv-channel:access allow <id>` for that person, or `/cv-channel:access policy pairing` to turn codes on. |
 | Channel never connects, but the server is healthy | You started Claude without the channel flag, so the channel isn't registered. |
 
 ### Who can run it, and how
@@ -224,16 +225,21 @@ A relayed prompt expires after `CV_PERMISSION_TTL_MS` and can no longer be answe
 
 ### Sender gating
 
-**Every sender is denied by default.** Unauthorized messages are dropped silently.
+**Every sender is denied by default.** What an unknown sender sees depends on the access policy:
+
+- **`pairing`** (the default for new installs): the sender gets a reply in Carbon Voice with a 6-character code, valid for `CV_PAIRING_TTL_MS` (10 minutes). They give it to you and you run `/cv-channel:access pair <code>`. If the code expires, their next message gets a fresh one (at most one per minute).
+- **`allowlist`**: the sender is dropped silently and told nothing. An existing `access.json` that predates pairing migrates to this.
 
 Access is managed from the terminal with `/cv-channel:access`:
 
 ```
 /cv-channel:access list
+/cv-channel:access pair <code>
 /cv-channel:access allow <user-id>
 /cv-channel:access remove <user-id>
 /cv-channel:access block <user-id>
 /cv-channel:access unblock <user-id>
+/cv-channel:access policy <pairing|allowlist>
 ```
 
 Allowlist changes are **only** made this way. The channel server reads
@@ -242,9 +248,7 @@ Allowlist changes are **only** made this way. The channel server reads
 allowlisting anyone. The skill itself refuses requests that arrived over the
 channel. Edits take effect on the next inbound message, without a restart.
 
-When an unknown sender messages, Claude is told once per session so it can pass the ID along to you. Acting on it is your call, at the terminal.
-
-If the allowlist is completely empty, the sender gets one reply in Carbon Voice: *"Allow Sender list is currently empty. Go to Claude to approve senders."*
+When an unknown sender messages, Claude is told (once per session under `allowlist`; with each new code under `pairing`) so it can pass the ID or code along to you. Acting on it is your call, at the terminal. A pairing code is only a request: nothing is allowed until you type `pair <code>`.
 
 ### What allowing someone grants
 
@@ -292,7 +296,7 @@ MIT
 
 ## Support
 
-- GitHub Issues: https://github.com/PhononX/cv-claude-channel/issues
+- GitHub Issues: https://github.com/PhononX/cv-claude-channels/issues
 - Carbon Voice API: https://api.carbonvoice.app
 
 ## Acknowledgments
