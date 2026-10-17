@@ -11,8 +11,16 @@
 import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import * as path from 'node:path'
+import { readFileSync } from 'node:fs'
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
+
+const readJson = rel => JSON.parse(readFileSync(path.join(root, rel), 'utf8'))
+const versions = {
+  'package.json': readJson('package.json').version,
+  '.claude-plugin/plugin.json': readJson('.claude-plugin/plugin.json').version,
+  '.claude-plugin/marketplace.json': readJson('.claude-plugin/marketplace.json').plugins?.find(p => p.name === 'cv-channel')?.version,
+}
 
 const proc = spawn('node', ['dist/cv-claude-channel.js'], {
   cwd: root,
@@ -59,6 +67,8 @@ setTimeout(() => {
 
   const checks = [
     ['server advertises the cv-channel slug', init?.serverInfo?.name === 'cv-channel'],
+    [`versions agree (server ${init?.serverInfo?.version}; ${Object.entries(versions).map(([k, v]) => `${k} ${v}`).join('; ')})`,
+      Object.values(versions).every(v => v && v === init?.serverInfo?.version)],
     ['claude/channel capability declared', 'claude/channel' in experimental],
     ['claude/channel/permission capability declared', 'claude/channel/permission' in experimental],
     ['send_message exposed', tools.includes('send_message')],
